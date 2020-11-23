@@ -1594,7 +1594,8 @@ namespace Oxide.Plugins
             {
                 if (!bAdded)
                 {
-                    StartTryToEnd();
+                //    StartTryToEnd();
+                return;
                 }
             }
 
@@ -2256,10 +2257,10 @@ namespace Oxide.Plugins
 
                 AddLooter(player);
 
-                if (e is BoxStorage || e is BuildingPrivlidge)
-                {
-                    StartTryToEnd();
-                }
+//                if (e is BoxStorage || e is BuildingPrivlidge)
+//                {
+//                    StartTryToEnd();
+//                }
             }
 
             private void StartPlayingWithFire()
@@ -3362,7 +3363,7 @@ namespace Oxide.Plugins
                     Subscribe(nameof(OnNpcKits));
                     Subscribe(nameof(OnNpcTarget));
                     SetupNpcKits();
-                    Invoke(SpawnNpcs, 1f);
+//                    Invoke(SpawnNpcs, 1f);
                 }
 
                 Subscribe(nameof(OnPlayerDeath));
@@ -6442,7 +6443,7 @@ namespace Oxide.Plugins
             }
 
             raid._containers.Remove(container);
-            raid.StartTryToEnd();
+//            raid.StartTryToEnd();
             UI.Update(raid);
 
             foreach (var x in Raids.Values)
@@ -6469,6 +6470,7 @@ namespace Oxide.Plugins
 
                     if (raid.Options.RequiresCupboardAccess && _config.EventMessages.AnnounceRaidUnlock)
                     {
+                        raid.StartTryToEnd();
                         foreach (var p in BasePlayer.activePlayerList)
                         {
                             Backbone.Message(p, "OnRaidFinished", p.UserIDString, FormatGridReference(raid.Location));
