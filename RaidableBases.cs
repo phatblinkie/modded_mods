@@ -1,4 +1,5 @@
-﻿//#define DEBUG
+#define USE_HTN_HOOK
+//#define DEBUG
 
 using Facepunch;
 using Facepunch.Math;
@@ -27,21 +28,23 @@ using static NPCPlayerApex;
 
 namespace Oxide.Plugins
 {
-    [Info("Raidable Bases", "nivex", "1.5.0")]
+    [Info("Raidable Bases", "nivex", "1.5.2")]
     [Description("Create fully automated raidable bases with npcs.")]
     class RaidableBases : RustPlugin
     {
         [PluginReference]
-        private Plugin DangerousTreasures, Vanish, LustyMap, ZoneManager, Economics, ServerRewards, Map, GUIAnnouncements, CopyPaste, Friends, Clans, Kits, TruePVE, Spawns, NightLantern, Wizardry;
+        private Plugin DangerousTreasures, Vanish, LustyMap, ZoneManager, Economics, ServerRewards, Map, GUIAnnouncements, CopyPaste, Friends, Clans, Kits, TruePVE, Spawns, NightLantern, Wizardry, NextGenPVE;
 
         protected static SingletonBackbone Backbone { get; set; }
         protected RotationCycle Cycle { get; set; } = new RotationCycle();
         public Dictionary<int, List<BaseEntity>> Bases { get; } = new Dictionary<int, List<BaseEntity>>();
         public Dictionary<int, RaidableBase> Raids { get; } = new Dictionary<int, RaidableBase>();
-        public List<int> Indices { get; set; } = new List<int>();
+        public Dictionary<BaseEntity, RaidableBase> RaidEntities { get; } = new Dictionary<BaseEntity, RaidableBase>();
+        public Dictionary<int, RaidableBase> Indices { get; set; } = new Dictionary<int, RaidableBase>();
+        public Dictionary<ulong, RaidableBase> Npcs { get; set; } = new Dictionary<ulong, RaidableBase>();
         protected Dictionary<ulong, DelaySettings> PvpDelay { get; } = new Dictionary<ulong, DelaySettings>();
         private Dictionary<string, List<ulong>> Skins { get; } = new Dictionary<string, List<ulong>>();
-        private Dictionary<string, List<ulong>> WorkshopSkins { get; } = new Dictionary<string, List<ulong>>();
+        private Dictionary<string, HashSet<ulong>> WorkshopSkins { get; } = new Dictionary<string, HashSet<ulong>>();
         private Dictionary<MonumentInfo, float> monuments { get; set; } = new Dictionary<MonumentInfo, float>();
         private Dictionary<Vector3, float> managedZones { get; set; } = new Dictionary<Vector3, float>();
         private Dictionary<int, MapInfo> mapMarkers { get; set; } = new Dictionary<int, MapInfo>();
@@ -55,18 +58,32 @@ namespace Oxide.Plugins
         protected Coroutine gridCoroutine { get; set; }
         private Stopwatch gridStopwatch { get; } = new Stopwatch();
         private StringBuilder _sb { get; } = new StringBuilder();
-        protected float Radius { get; } = 25f;
+        protected const float Radius = 25f;
         private bool wiped { get; set; }
         private float lastSpawnRequestTime { get; set; }
         private float gridTime { get; set; }
         private bool IsUnloading { get; set; }
-        private static bool _true = true;
-        private static bool _false = false;
+        private int _maxOnce { get; set; }
+        private List<string> tryBuyCooldowns { get; set; } = new List<string>();
+        private ItemComparerer itemComparer { get; } = new ItemComparerer();
+
+        public class BuildingProfile
+        {
+            public BuildingOptions Options;
+            public string Name;
+        }
 
         public class DelaySettings
         {
             public Timer Timer;
             public bool AllowPVP;
+        }
+
+        private enum HandledResult
+        {
+            Allowed,
+            Blocked,
+            None
         }
 
         public enum RaidableType
@@ -97,6 +114,7 @@ namespace Oxide.Plugins
             public ItemDefinition BoxDefinition { get; }
             public string ExplosionMarker { get; }
             public string CodeLock { get; }
+            public string FireballSmall { get; }
             public string Fireball { get; }
             public string HighExternalWoodenWall { get; }
             public string HighExternalStoneWall { get; }
@@ -114,7 +132,8 @@ namespace Oxide.Plugins
                 BoxDefinition = ItemManager.FindItemDefinition(StringPool.Get(2735448871));
                 CodeLock = StringPool.Get(3518824735);
                 ExplosionMarker = StringPool.Get(4060989661);
-                Fireball = StringPool.Get(2086405370);
+                FireballSmall = StringPool.Get(2086405370);
+                Fireball = StringPool.Get(3369311876);
                 HighExternalWoodenWall = StringPool.Get(1745077396);
                 HighExternalStoneWall = StringPool.Get(1585379529);
                 Ladder = StringPool.Get(2150203378);
@@ -134,12 +153,22 @@ namespace Oxide.Plugins
             private StringBuilder sb => Plugin._sb;
             public StoredData Data => Plugin.storedData;
             public List<FinalDestination> Destinations { get; set; }
+            public string Easy { get; set; }
+            public string Medium { get; set; }
+            public string Hard { get; set; }
+            public string Expert { get; set; }
+            public string Nightmare { get; set; }
 
             public SingletonBackbone(RaidableBases plugin)
             {
                 Plugin = plugin;
                 Path = new ResourcePath();
                 Destinations = new List<FinalDestination>();
+                Easy = RemoveFormatting(GetMessage("ModeEasy")).ToLower();
+                Medium = RemoveFormatting(GetMessage("ModeMedium")).ToLower();
+                Hard = RemoveFormatting(GetMessage("ModeHard")).ToLower();
+                Expert = RemoveFormatting(GetMessage("ModeExpert")).ToLower();
+                Nightmare = RemoveFormatting(GetMessage("ModeNightmare")).ToLower();
             }
 
             public void Destroy()
@@ -161,7 +190,7 @@ namespace Oxide.Plugins
             {
                 sb.Length = 0;
 
-                if (_config.EventMessages.Prefix && id != "server_console" && id != null)
+                if (_config.EventMessages.Prefix && id != null && id != "server_console" && !key.EndsWith("Flag"))
                 {
                     sb.Append(lang.GetMessage("Prefix", Plugin, id));
                 }
@@ -269,7 +298,7 @@ namespace Oxide.Plugins
 
                 foreach (var b in list)
                 {
-                    if (Distance2D(a.Location, b.Location) <= radius)
+                    if (InRange(a.Location, b.Location, radius))
                     {
                         Remove(b);
                     }
@@ -341,18 +370,18 @@ namespace Oxide.Plugins
             {
                 if (mode == RaidableMode.Disabled)
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (!_config.Settings.Management.RequireAllSpawned || mode == RaidableMode.Random || type == RaidableType.Grid || type == RaidableType.Manual || TryClear(type, mode))
                 {
-                    return _true;
+                    return true;
                 }
 
                 List<string> keyList;
                 if (!Buildings.TryGetValue(mode, out keyList))
                 {
-                    return _true;
+                    return true;
                 }
 
                 return !keyList.Contains(key);
@@ -363,7 +392,7 @@ namespace Oxide.Plugins
                 List<string> keyList;
                 if (!Buildings.TryGetValue(mode, out keyList))
                 {
-                    return _false;
+                    return false;
                 }
 
                 foreach (var building in _config.RaidableBases.Buildings)
@@ -382,18 +411,18 @@ namespace Oxide.Plugins
                     {
                         if (!keyList.Contains(kvp.Key) && FileExists(kvp.Key))
                         {
-                            return _false;
+                            return false;
                         }
                     }
 
                     if (!keyList.Contains(building.Key) && FileExists(building.Key))
                     {
-                        return _false;
+                        return false;
                     }
                 }
 
                 keyList.Clear();
-                return _true;
+                return true;
             }
         }
 
@@ -405,185 +434,6 @@ namespace Oxide.Plugins
             public string RaidTime { get; set; } = DateTime.MinValue.ToString();
             public int TotalEvents { get; set; }
             public StoredData() { }
-        }
-
-        private void OnPluginLoaded(Plugin plugin)
-        {
-            switch (plugin.Title)
-            {
-                case "Dangerous Treasures":
-                    {
-                        DangerousTreasures = plugin;
-
-                        if (DangerousTreasures.Version < new VersionNumber(1, 4, 1))
-                        {
-                            DangerousTreasures = null;
-                        }
-                        break;
-                    }
-                case "Vanish":
-                    {
-                        Vanish = plugin;
-                        break;
-                    }
-                case "Wizardry":
-                    {
-                        Wizardry = plugin;
-                        break;
-                    }
-                case "Night Lantern":
-                    {
-                        NightLantern = plugin;
-                        break;
-                    }
-                case "Spawns":
-                    {
-                        Spawns = plugin;
-                        break;
-                    }
-                case "TruePVE":
-                    {
-                        TruePVE = plugin;
-                        break;
-                    }
-                case "LustyMap":
-                    {
-                        LustyMap = plugin;
-                        break;
-                    }
-                case "ZoneManager":
-                    {
-                        ZoneManager = plugin;
-                        break;
-                    }
-                case "Economics":
-                    {
-                        Economics = plugin;
-                        break;
-                    }
-                case "ServerRewards":
-                    {
-                        ServerRewards = plugin;
-                        break;
-                    }
-                case "Map":
-                    {
-                        Map = plugin;
-                        break;
-                    }
-                case "GUIAnnouncements":
-                    {
-                        GUIAnnouncements = plugin;
-                        break;
-                    }
-                case "CopyPaste":
-                    {
-                        CopyPaste = plugin;
-                        break;
-                    }
-                case "Clans":
-                    {
-                        Clans = plugin;
-                        break;
-                    }
-                case "Friends":
-                    {
-                        Friends = plugin;
-                        break;
-                    }
-                case "Kits":
-                    {
-                        Kits = plugin;
-                        break;
-                    }
-            }
-        }
-
-        private void OnPluginUnloaded(Plugin plugin)
-        {
-            switch (plugin.Title)
-            {
-                case "Dangerous Treasures":
-                    {
-                        DangerousTreasures = null;
-                        break;
-                    }
-                case "Vanish":
-                    {
-                        Vanish = null;
-                        break;
-                    }
-                case "Wizardry":
-                    {
-                        Wizardry = null;
-                        break;
-                    }
-                case "Night Lantern":
-                    {
-                        NightLantern = null;
-                        break;
-                    }
-                case "Spawns":
-                    {
-                        Spawns = null;
-                        break;
-                    }
-                case "TruePVE":
-                    {
-                        TruePVE = null;
-                        break;
-                    }
-                case "LustyMap":
-                    {
-                        LustyMap = null;
-                        break;
-                    }
-                case "ZoneManager":
-                    {
-                        ZoneManager = null;
-                        break;
-                    }
-                case "Economics":
-                    {
-                        Economics = null;
-                        break;
-                    }
-                case "ServerRewards":
-                    {
-                        ServerRewards = null;
-                        break;
-                    }
-                case "Map":
-                    {
-                        Map = null;
-                        break;
-                    }
-                case "GUIAnnouncements":
-                    {
-                        GUIAnnouncements = null;
-                        break;
-                    }
-                case "CopyPaste":
-                    {
-                        CopyPaste = null;
-                        break;
-                    }
-                case "Clans":
-                    {
-                        Clans = null;
-                        break;
-                    }
-                case "Friends":
-                    {
-                        Friends = null;
-                        break;
-                    }
-                case "Kits":
-                    {
-                        Kits = null;
-                        break;
-                    }
-            }
         }
 
         private class PlayWithFire : FacepunchBehaviour
@@ -636,7 +486,7 @@ namespace Oxide.Plugins
             {
                 float distance = Vector3.Distance(fireball.ServerPosition, attacker.transform.position);
 
-                while (!Backbone.Plugin.IsUnloading && attacker != null && fireball != null && !fireball.IsDestroyed && Distance2D(fireball.ServerPosition, attacker.transform.position) > 2.5f)
+                while (!Backbone.Plugin.IsUnloading && attacker != null && fireball != null && !fireball.IsDestroyed && !InRange(fireball.ServerPosition, attacker.transform.position, 2.5f))
                 {
                     fireball.ServerPosition = Vector3.MoveTowards(fireball.ServerPosition, attacker.transform.position, distance * 0.1f);
                     yield return Coroutines.WaitForSeconds(0.3f);
@@ -665,20 +515,22 @@ namespace Oxide.Plugins
             {
                 this.player = player;
                 this.raid = raid;
-                raid.Inputs.Add(this);
+                raid.Inputs[player] = this;
                 input = player.serverInput;
                 InvokeRepeating(Repeater, 0f, 0.1f);
             }
 
             private void Repeater()
             {
-                if (!player || !player.IsConnected || player.inventory == null || player.inventory.containerBelt == null || player.IsDead() || raid == null)
+                if (raid == null)
                 {
-                    if (raid != null && raid.IsPayLocked && raid.IsOpened)
-                    {
-                        raid.TryInvokeResetPayLock();
-                    }
+                    Destroy(this);
+                    return;
+                }
 
+                if (!player || !player.IsConnected)
+                {
+                    raid?.TryInvokeResetPayLock();
                     Destroy(this);
                     return;
                 }
@@ -723,7 +575,7 @@ namespace Oxide.Plugins
 
                     var rot = Quaternion.LookRotation(hit.normal, Vector3.up); // * Quaternion.Euler(0f, 0f, player.eyes.rotation.eulerAngles.z);
                     var e = GameManager.server.CreateEntity(Backbone.Path.Ladder, hit.point, rot, true); // as BaseLadder;
-                    
+
                     if (e == null)
                     {
                         Destroy(this);
@@ -755,7 +607,16 @@ namespace Oxide.Plugins
                 player.Invoke(action, 0.1f);
             }
 
-            public bool IsLadderNear(Vector3 target)
+            /*public bool IsLadderNear(Vector3 target)
+            {
+                var list = new List<BaseLadder>();
+
+                Vis.Entities<BaseLadder>(target, 0.3f, list, Layers.Mask.Deployed, QueryTriggerInteraction.Ignore);
+
+                return list.Count > 0;
+            }*/
+
+            private bool IsLadderNear(Vector3 target)
             {
                 int hits = Physics.OverlapSphereNonAlloc(target, 0.3f, Vis.colBuffer, Layers.Mask.Deployed, QueryTriggerInteraction.Ignore);
                 bool flag = false;
@@ -775,17 +636,9 @@ namespace Oxide.Plugins
 
             private void OnDestroy()
             {
-                if (raid != null)
-                {
-                    raid.Inputs.Remove(this);
-                }
-
-                if (player != null)
-                {
-                    UI.DestroyStatusUI(player);
-                }
-
                 CancelInvoke();
+                UI.DestroyStatusUI(player);
+                raid?.Inputs?.Remove(player);
                 Destroy(this);
             }
         }
@@ -796,6 +649,8 @@ namespace Oxide.Plugins
             private List<Vector3> positions;
             public AttackOperator.AttackType attackType;
             private NpcSettings settings;
+            private bool isRanged;
+            private BasePlayer target;
 
             private void OnDestroy()
             {
@@ -810,6 +665,7 @@ namespace Oxide.Plugins
                 this.positions = positions;
                 this.settings = settings;
                 attackType = IsMelee(npc) ? AttackOperator.AttackType.CloseRange : AttackOperator.AttackType.LongRange;
+                isRanged = attackType != AttackOperator.AttackType.CloseRange;
 
                 Backbone.Destinations.Add(this);
                 InvokeRepeating(Go, 0f, 7.5f);
@@ -817,6 +673,11 @@ namespace Oxide.Plugins
 
             public void Attack(BasePlayer player, bool converge = true)
             {
+                if (target == player)
+                {
+                    return;
+                }
+
                 if (!IsInvoking(Attack))
                 {
                     InvokeRepeating(Attack, 0f, 1f);
@@ -831,6 +692,7 @@ namespace Oxide.Plugins
                 npc.AttackTarget = player;
                 npc.lastAttacker = player;
                 npc.AiContext.LastAttacker = player;
+                target = player;
 
                 if (converge)
                 {
@@ -840,21 +702,17 @@ namespace Oxide.Plugins
 
             private void Attack()
             {
-                if (npc.AttackTarget == null)
+                if (npc.AttackTarget == null || !(npc.AttackTarget is BasePlayer))
                 {
                     return;
                 }
 
                 var attacker = npc.AttackTarget as BasePlayer;
 
-                if (!attacker.IsValid())
-                {
-                    return;
-                }
-
                 if (attacker.IsDead())
                 {
                     Forget();
+                    CancelInvoke(Attack);
                     InvokeRepeating(Go, 0f, 7.5f);
                     return;
                 }
@@ -863,7 +721,7 @@ namespace Oxide.Plugins
                 npc.IsStopped = false;
                 npc.RandomMove();
 
-                if (npc.AttackTarget.IsVisible(npc.eyes.position, attacker.eyes.position))
+                if (attacker.IsVisible(npc.eyes.position, attacker.eyes.position))
                 {
                     HumanAttackOperator.AttackEnemy(npc.AiContext, attackType);
                 }
@@ -871,7 +729,6 @@ namespace Oxide.Plugins
 
             private void Forget()
             {
-                CancelInvoke(Attack);
                 npc.Stats.AggressionRange = settings.AggressionRange;
                 npc.Stats.DeaggroRange = settings.AggressionRange * 1.125f;
                 npc.lastDealtDamageTime = Time.time - 21f;
@@ -884,12 +741,9 @@ namespace Oxide.Plugins
                 npc.LastAttackedDir = Vector3.zero;
             }
 
-            public void Warp(Vector3 position = default(Vector3))
+            public void Warp()
             {
-                if (position == default(Vector3))
-                {
-                    position = positions.GetRandom();
-                }
+                var position = positions.GetRandom();
 
                 npc.Pause();
                 npc.ServerPosition = position;
@@ -901,14 +755,15 @@ namespace Oxide.Plugins
 
             private void Go()
             {
+                if (npc.IsHeadUnderwater())
+                {
+                    npc.Kill();
+                    Destroy(this);
+                    return;
+                }
+
                 if (npc.AttackTarget == null)
                 {
-                    if (npc.IsHeadUnderwater())
-                    {
-                        npc.Kill();
-                        return;
-                    }
-
                     npc.NeverMove = true;
 
                     if (npc.IsStuck)
@@ -931,11 +786,9 @@ namespace Oxide.Plugins
 
             private void Converge(BasePlayer player)
             {
-                bool isRanged = !IsMelee(player);
-
                 foreach (var fd in Backbone.Destinations)
                 {
-                    if (fd != this && fd.npc.IsValid() && fd.npc.IsAlive() && fd.npc.AttackTarget == null && fd.npc.Distance(npc) < 25f)
+                    if (fd != this && fd.npc.IsValid() && fd.npc.AttackTarget == null && fd.npc.IsAlive() && fd.npc.Distance(npc) < 25f)
                     {
                         if (isRanged && fd.attackType == AttackOperator.AttackType.CloseRange) continue;
                         fd.npc.SetFact(Facts.AllyAttackedRecently, 1, true, true);
@@ -952,10 +805,23 @@ namespace Oxide.Plugins
 
                 if (attackEntity == null)
                 {
-                    return _false;
+                    return false;
                 }
 
                 return attackEntity is BaseMelee;
+            }
+        }
+
+        public class ItemComparerer : IEqualityComparer<TreasureItem>
+        {
+            public bool Equals(TreasureItem x, TreasureItem y)
+            {
+                return x != null && y != null && x.GetHashCode() == y.GetHashCode();
+            }
+
+            public int GetHashCode(TreasureItem obj)
+            {
+                return obj.GetHashCode();
             }
         }
 
@@ -966,12 +832,11 @@ namespace Oxide.Plugins
             private Dictionary<string, List<string>> _friends;
             public List<StorageContainer> _containers;
             public List<StorageContainer> _allcontainers;
-            public List<BuildingPrivlidge> privs;
             private List<ulong> BoxSkins;
-            public List<PlayerInputEx> Inputs;
+            public Dictionary<BasePlayer, PlayerInputEx> Inputs;
             public List<NPCPlayerApex> npcs;
             public List<string> raiders;
-            public List<ulong> friends;
+            public List<BasePlayer> friends;
             public List<BasePlayer> intruders;
             private Dictionary<PlayerCorpse, BasePlayer> corpses;
             private Dictionary<FireBall, PlayWithFire> fireballs;
@@ -979,13 +844,14 @@ namespace Oxide.Plugins
             private List<SphereEntity> spheres;
             private List<BaseEntity> lights;
             private List<BaseOven> ovens;
-            private List<AutoTurret> turrets;
-            private List<BaseEntity> weapons;
+            public List<AutoTurret> turrets;
             private List<Door> doors;
             private List<CustomDoorManipulator> doorControllers;
             public List<uint> BuiltList;
+            public List<uint> blocks;
             public Dictionary<string, float> lastActive;
             public List<string> ids;
+            public BuildingPrivlidge priv { get; set; }
             private Dictionary<string, List<string>> npcKits { get; set; }
             private MapMarkerExplosion explosionMarker { get; set; }
             private MapMarkerGenericRadius genericMarker { get; set; }
@@ -1019,106 +885,23 @@ namespace Oxide.Plugins
             public string DifficultyMode { get; set; }
             public bool IsLooted => CanUndo();
             public bool IsLoading => setupRoutine != null;
-            private float Radius { get; } = 25f;
             private bool markerCreated { get; set; }
             private bool lightsOn { get; set; }
             private bool killed { get; set; }
             private int itemAmountSpawned { get; set; }
-            private int privAmountSpawned { get; set; }
-            private ItemComparerer itemComparer { get; } = new ItemComparerer();
+            private bool privSpawned { get; set; }
             public string markerName { get; set; }
             public string NoMode { get; set; }
             public bool isAuthorized { get; set; }
             public bool Engaged { get; set; }
+            private TurretState _turretsState { get; set; } = TurretState.Unknown;
+            private ItemDefinition lowgradefuel { get; set; } = ItemManager.FindItemDefinition("lowgradefuel");
 
-            public class ItemComparerer : IEqualityComparer<TreasureItem>
+            private enum TurretState
             {
-                public bool Equals(TreasureItem x, TreasureItem y)
-                {
-                    return x != null && y != null && x.GetHashCode() == y.GetHashCode();
-                }
-
-                public int GetHashCode(TreasureItem obj)
-                {
-                    return obj.GetHashCode();
-                }
-            }
-
-            private bool IsHogging(BasePlayer player)
-            {
-                if (!_config.Settings.Management.PreventHogging || CanBypass(player))
-                {
-                    return _false;
-                }
-
-                foreach (var raid in Backbone.Plugin.Raids.Values)
-                {
-                    if (!raid.IsPayLocked && raid.IsOpened && raid.BaseIndex != BaseIndex && raid.Any(player.userID, false))
-                    {
-                        if (CanMessage(player))
-                        {
-                            Backbone.Message(player, "HoggingFinishYourRaid", player.UserIDString, PositionToGrid(raid.Location));
-                        }
-
-                        return _true;
-                    }
-                }
-
-                if (!_config.Settings.Management.Lockout.IsBlocking() || Backbone.HasPermission(player.UserIDString, bypassBlockPermission))
-                {
-                    return _false;
-                }
-
-                foreach (var raid in Backbone.Plugin.Raids.Values)
-                {
-                    if (raid.BaseIndex != BaseIndex && !raid.IsPayLocked && raid.IsOpened && IsHogging(player, raid))
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
-            }
-
-            private bool IsHogging(BasePlayer player, RaidableBase raid)
-            {
-                foreach (var intruder in raid.intruders)
-                {
-                    if (!intruder.IsValid())
-                    {
-                        continue;
-                    }
-
-                    if (_config.Settings.Management.Lockout.BlockTeams && raid.IsOnSameTeam(player.userID, intruder.userID))
-                    {
-                        if (CanMessage(player))
-                        {
-                            Backbone.Message(player, "HoggingFinishYourRaidTeam", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
-                        }
-
-                        return _true;
-                    }
-                    else if (_config.Settings.Management.Lockout.BlockFriends && raid.IsFriends(player.UserIDString, intruder.UserIDString))
-                    {
-                        if (CanMessage(player))
-                        {
-                            Backbone.Message(player, "HoggingFinishYourRaidFriend", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
-                        }
-
-                        return _true;
-                    }
-                    else if (_config.Settings.Management.Lockout.BlockClans && raid.IsInSameClan(player.UserIDString, intruder.UserIDString))
-                    {
-                        if (CanMessage(player))
-                        {
-                            Backbone.Message(player, "HoggingFinishYourRaidClan", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
-                        }
-
-                        return _true;
-                    }
-                }
-
-                return _false;
+                Online,
+                Offline,
+                Unknown
             }
 
             private void CreatePool()
@@ -1128,12 +911,11 @@ namespace Oxide.Plugins
                 _friends = Pool.Get<Dictionary<string, List<string>>>();
                 _containers = Pool.GetList<StorageContainer>();
                 _allcontainers = Pool.GetList<StorageContainer>();
-                privs = Pool.GetList<BuildingPrivlidge>();
                 BoxSkins = Pool.GetList<ulong>();
-                Inputs = Pool.GetList<PlayerInputEx>();
+                Inputs = Pool.Get<Dictionary<BasePlayer, PlayerInputEx>>();
                 npcs = Pool.GetList<NPCPlayerApex>();
                 raiders = Pool.GetList<string>();
-                friends = Pool.GetList<ulong>();
+                friends = Pool.GetList<BasePlayer>();
                 intruders = Pool.GetList<BasePlayer>();
                 corpses = Pool.Get<Dictionary<PlayerCorpse, BasePlayer>>();
                 fireballs = Pool.Get<Dictionary<FireBall, PlayWithFire>>();
@@ -1142,10 +924,10 @@ namespace Oxide.Plugins
                 lights = Pool.GetList<BaseEntity>();
                 ovens = Pool.GetList<BaseOven>();
                 turrets = Pool.GetList<AutoTurret>();
-                weapons = Pool.GetList<BaseEntity>();
                 doors = Pool.GetList<Door>();
                 doorControllers = Pool.GetList<CustomDoorManipulator>();
                 BuiltList = Pool.GetList<uint>();
+                blocks = Pool.GetList<uint>();
                 lastActive = Pool.Get<Dictionary<string, float>>();
                 ids = Pool.Get<List<string>>();
             }
@@ -1157,7 +939,6 @@ namespace Oxide.Plugins
                 _friends.Clear();
                 _containers.Clear();
                 _allcontainers.Clear();
-                privs.Clear();
                 BoxSkins.Clear();
                 Inputs.Clear();
                 npcs.Clear();
@@ -1171,10 +952,10 @@ namespace Oxide.Plugins
                 lights.Clear();
                 ovens.Clear();
                 turrets.Clear();
-                weapons.Clear();
                 doors.Clear();
                 doorControllers.Clear();
                 BuiltList.Clear();
+                blocks.Clear();
                 lastActive.Clear();
                 ids.Clear();
 
@@ -1183,7 +964,6 @@ namespace Oxide.Plugins
                 Pool.Free(ref _friends);
                 Pool.Free(ref _containers);
                 Pool.Free(ref _allcontainers);
-                Pool.Free(ref privs);
                 Pool.Free(ref BoxSkins);
                 Pool.Free(ref Inputs);
                 Pool.Free(ref npcs);
@@ -1197,10 +977,10 @@ namespace Oxide.Plugins
                 Pool.Free(ref lights);
                 Pool.Free(ref ovens);
                 Pool.Free(ref turrets);
-                Pool.Free(ref weapons);
                 Pool.Free(ref doors);
                 Pool.Free(ref doorControllers);
                 Pool.Free(ref BuiltList);
+                Pool.Free(ref blocks);
                 Pool.Free(ref lastActive);
                 Pool.Free(ref ids);
             }
@@ -1212,6 +992,14 @@ namespace Oxide.Plugins
                 spawnTime = Time.realtimeSinceStartup;
             }
 
+            private void OnDestroy()
+            {
+                Interface.CallHook("OnRaidableBaseEnded", Location, (int)Options.Mode);
+                Despawn();
+                FreePool();
+                Destroy(this);
+            }
+
             private void OnTriggerEnter(Collider col)
             {
                 var m = col?.ToBaseEntity() as BaseMountable;
@@ -1221,31 +1009,40 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                var p = col?.ToBaseEntity() as BasePlayer;
+                var player = col?.ToBaseEntity() as BasePlayer;
+                var players = new List<BasePlayer>();
 
-                if (!p.IsValid() || p.IsNpc)
+                if (m.IsValid())
                 {
-                    return;
+                    players = GetMountedPlayers(m);
                 }
 
-                if (!p.IsConnected && Time.time - p.sleepStartTime < 2f)
+                if (player.IsValid() && !player.IsNpc && !players.Contains(player))
                 {
-                    return;
+                    players.Add(player);
                 }
 
-                OnEnterRaid(p);
+                foreach (var p in players)
+                {
+                    if (!p.IsConnected && Time.time - p.sleepStartTime < 2f)
+                    {
+                        continue;
+                    }
+
+                    OnEnterRaid(p);
+                }
             }
 
             private bool JustRespawned(BasePlayer player)
             {
-                return player?.lifeStory?.timeBorn == (uint)Epoch.Current;
+                return player.lifeStory?.timeBorn - (uint)Epoch.Current < 1f;
             }
 
             public void OnEnterRaid(BasePlayer p)
             {
                 if (Type != RaidableType.None)
                 {
-                    if (!_config.Settings.Management.AllowTeleport && !CanBypass(p) && Distance2D(p.transform.position, Location) < Radius && p.IsConnected)
+                    if (!_config.Settings.Management.AllowTeleport && p.IsConnected && !CanBypass(p) && InRange(p.transform.position, Location, Radius, false))
                     {
                         if (CanMessage(p))
                         {
@@ -1282,17 +1079,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                bool flag = false;
-
-                foreach (var x in Inputs)
-                {
-                    if (x.player == p)
-                    {
-                        flag = true;
-                    }
-                }
-
-                if (!flag)
+                if (!Inputs.ContainsKey(p))
                 {
                     p.gameObject.AddComponent<PlayerInputEx>().Setup(p, this);
                 }
@@ -1302,6 +1089,12 @@ namespace Oxide.Plugins
                 if (_config.EventMessages.AnnounceEnterExit)
                 {
                     Backbone.Message(p, AllowPVP ? "OnPlayerEntered" : "OnPlayerEnteredPVE", p.UserIDString);
+                }
+
+                if (intruders.Count > 0 && _turretsState != TurretState.Online)
+                {
+                    CancelInvoke(SetTurretsState);
+                    SetTurretsState();
                 }
 
                 UI.Update(this, p);
@@ -1325,60 +1118,54 @@ namespace Oxide.Plugins
                     players = GetMountedPlayers(m);
                 }
 
-                if (player.IsValid() && !players.Contains(player))
+                if (player.IsValid() && !player.IsNpc && !players.Contains(player))
                 {
                     players.Add(player);
                 }
 
-                OnPlayersExit(players);
-            }
+                if (players.Count == 0)
+                {
+                    return;
+                }
 
-            public void OnPlayersExit(List<BasePlayer> players)
-            {
                 foreach (var p in players)
                 {
-                    UI.DestroyStatusUI(p);
+                    OnPlayerExit(p);
+                }
+            }
 
-                    foreach (var x in Inputs)
+            public void OnPlayerExit(BasePlayer p)
+            {
+                UI.DestroyStatusUI(p);
+
+                if (Inputs.ContainsKey(p))
+                {
+                    Destroy(Inputs[p]);
+                }
+
+                if (!intruders.Contains(p))
+                {
+                    return;
+                }
+
+                intruders.Remove(p);
+                Interface.CallHook("OnPlayerExitedRaidableBase", p, Location, AllowPVP);
+
+                if (_config.Settings.Management.PVPDelay > 0)
+                {
+                    if (!IsPVE() || !AllowPVP)
                     {
-                        if (x.player == p)
-                        {
-                            Destroy(x);
-                            break;
-                        }
+                        goto enterExit;
                     }
 
-                    if (!intruders.Contains(p))
+                    if (_config.EventMessages.AnnounceEnterExit)
                     {
-                        continue;
-                    }
-
-                    intruders.Remove(p);
-                    Interface.CallHook("OnPlayerExitedRaidableBase", p, Location, AllowPVP);
-
-                    if (_config.Settings.Management.PVPDelay <= 0)
-                    {
-                        if (!p.IsNpc && _config.EventMessages.AnnounceEnterExit)
-                        {
-                            Backbone.Message(p, AllowPVP ? "OnPlayerExit" : "OnPlayerExitPVE", p.UserIDString);
-                        }
-
-                        continue;
-                    }
-
-                    if (Backbone.Plugin.TruePVE == null || !AllowPVP)
-                    {
-                        continue;
+                        string arg = Backbone.GetMessage("PVPFlag", p.UserIDString).Replace("[", string.Empty).Replace("] ", string.Empty);
+                        Backbone.Message(p, "DoomAndGloom", p.UserIDString, arg, _config.Settings.Management.PVPDelay);
                     }
 
                     ulong id = p.userID;
                     DelaySettings ds;
-
-                    if (!p.IsNpc && _config.EventMessages.AnnounceEnterExit)
-                    {
-                        Backbone.Message(p, "DoomAndGloom", p.UserIDString, Backbone.GetMessage("PVPFlag").Replace("[", string.Empty).Replace("]", string.Empty), _config.Settings.Management.PVPDelay);
-                    }
-
                     if (!Backbone.Plugin.PvpDelay.TryGetValue(id, out ds))
                     {
                         Backbone.Plugin.PvpDelay[id] = ds = new DelaySettings
@@ -1387,11 +1174,137 @@ namespace Oxide.Plugins
                             AllowPVP = AllowPVP
                         };
 
-                        continue;
+                        goto exit;
                     }
 
                     ds.Timer.Reset();
+                    goto exit;
                 }
+
+                enterExit:
+                if (_config.EventMessages.AnnounceEnterExit)
+                {
+                    Backbone.Message(p, AllowPVP ? "OnPlayerExit" : "OnPlayerExitPVE", p.UserIDString);
+                }
+
+                exit:
+                if (intruders.Count == 0)
+                {
+                    Invoke(SetTurretsState, 10f);
+                }
+            }
+
+            private bool IsHogging(BasePlayer player)
+            {
+                if (!_config.Settings.Management.PreventHogging || CanBypass(player))
+                {
+                    return false;
+                }
+
+                foreach (var raid in Backbone.Plugin.Raids.Values)
+                {
+                    if (!raid.IsPayLocked && raid.IsOpened && raid.BaseIndex != BaseIndex && raid.Any(player.userID, false))
+                    {
+                        if (CanMessage(player))
+                        {
+                            Backbone.Message(player, "HoggingFinishYourRaid", player.UserIDString, PositionToGrid(raid.Location));
+                        }
+
+                        return true;
+                    }
+                }
+
+                if (!_config.Settings.Management.Lockout.IsBlocking() || Backbone.HasPermission(player.UserIDString, bypassBlockPermission))
+                {
+                    return false;
+                }
+
+                foreach (var raid in Backbone.Plugin.Raids.Values)
+                {
+                    if (raid.BaseIndex != BaseIndex && !raid.IsPayLocked && raid.IsOpened && IsHogging(player, raid))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private bool IsHogging(BasePlayer player, RaidableBase raid)
+            {
+                foreach (var intruder in raid.intruders)
+                {
+                    if (!intruder.IsValid())
+                    {
+                        continue;
+                    }
+
+                    if (_config.Settings.Management.Lockout.BlockTeams && raid.IsOnSameTeam(player.userID, intruder.userID))
+                    {
+                        if (CanMessage(player))
+                        {
+                            Backbone.Message(player, "HoggingFinishYourRaidTeam", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
+                        }
+
+                        return true;
+                    }
+                    else if (_config.Settings.Management.Lockout.BlockFriends && raid.IsFriends(player.UserIDString, intruder.UserIDString))
+                    {
+                        if (CanMessage(player))
+                        {
+                            Backbone.Message(player, "HoggingFinishYourRaidFriend", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
+                        }
+
+                        return true;
+                    }
+                    else if (_config.Settings.Management.Lockout.BlockClans && raid.IsInSameClan(player.UserIDString, intruder.UserIDString))
+                    {
+                        if (CanMessage(player))
+                        {
+                            Backbone.Message(player, "HoggingFinishYourRaidClan", player.UserIDString, intruder.displayName, PositionToGrid(raid.Location));
+                        }
+
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private void SetTurretsState()
+            {
+                bool online = intruders.Count > 0;
+
+                if (online && _turretsState == TurretState.Online || !online && _turretsState == TurretState.Offline)
+                {
+                    return;
+                }
+
+                int count = turrets.Count;
+
+                if (count == 0 || count - turrets.RemoveAll(x => x == null || x.IsDestroyed) == 0)
+                {
+                    return;
+                }
+
+                foreach (var turret in turrets)
+                {
+                    if (online) // && !turret.booting && !turret.IsOnline())
+                    {
+                        turret.booting = true;
+                        Effect.server.Run(turret.onlineSound.resourcePath, turret, 0u, Vector3.zero, Vector3.zero, null, false);
+                        turret.SetIsOnline(true);
+                    }
+                    else //if (!online && (turret.booting || turret.IsOnline()))
+                    {
+                        turret.CancelInvoke(turret.SetOnline);
+                        turret.booting = false;
+                        Effect.server.Run(turret.offlineSound.resourcePath, turret, 0u, Vector3.zero, Vector3.zero, null, false);
+                        turret.SetIsOnline(false);
+                    }
+                }
+
+                _turretsState = online ? TurretState.Online : TurretState.Offline;
             }
 
             private void CheckCorpses()
@@ -1404,10 +1317,9 @@ namespace Oxide.Plugins
                     {
                         corpses.Remove(corpse.Key);
                     }
-                    else if (!Any(corpse.Value))
+                    else if (ownerId.IsSteamId() && !Any(corpse.Value))
                     {
                         EjectCorpse(corpse.Value, corpse.Key);
-                        corpses.Remove(corpse.Key);
                     }
                 }
 
@@ -1430,34 +1342,23 @@ namespace Oxide.Plugins
 
                 foreach (var target in targets)
                 {
-                    if (target == owner || friends.Contains(target.userID) || CanBypass(target))
+                    if (target == owner || friends.Contains(target) || CanBypass(target))
                     {
-                        if (!_config.Settings.Management.EjectSleepers || !target.IsSleeping())
-                        {
-                            continue;
-                        }
+                        continue;
                     }
 
-                    if (CanEject(target))
+                    if (CanEject(target) || _config.Settings.Management.EjectSleepers && target.IsSleeping())
                     {
                         intruders.Remove(target);
                         RemovePlayer(target);
                     }
                     else if (owner.IsValid())
                     {
-                        friends.Add(target.userID);
+                        friends.Add(target);
                     }
                 }
 
                 targets.Clear();
-            }
-
-            private void OnDestroy()
-            {
-                Interface.CallHook("OnRaidableBaseEnded", Location, (int)Options.Mode);
-                Despawn();
-                FreePool();
-                Destroy(this);
             }
 
             public void DestroyUI()
@@ -1484,25 +1385,33 @@ namespace Oxide.Plugins
             public bool IsUnderTerrain(Vector3 pos)
             {
                 float height = TerrainMeta.HeightMap.GetHeight(pos);
-                
+
                 if (pos.y - 1f > height || pos.y + 1f < height)
                 {
-                    return _false;
+                    return false;
                 }
 
-                return _true;
+                return true;
+            }
+
+            public static void Unload()
+            {
+                foreach (var raid in Backbone.Plugin.Raids.Values)
+                {
+                    raid.IsUnloading = true;
+                }
             }
 
             public void Despawn()
             {
-                IsOpened = _false;
+                IsOpened = false;
 
                 if (killed)
                 {
                     return;
                 }
 
-                killed = _true;
+                killed = true;
 
                 Interface.CallHook("OnRaidableBaseDespawn", Location, spawnTime, ID);
 
@@ -1544,7 +1453,7 @@ namespace Oxide.Plugins
             {
                 if (!looter.IsValid() || !IsAlly(looter) || looter.IsFlying || Backbone.Plugin.IsInvisible(looter))
                 {
-                    return _false;
+                    return false;
                 }
 
                 UpdateStatus(looter);
@@ -1552,10 +1461,10 @@ namespace Oxide.Plugins
                 if (!raiders.Contains(looter.UserIDString))
                 {
                     raiders.Add(looter.UserIDString);
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             private void FillAmmoTurret(AutoTurret turret)
@@ -1569,11 +1478,11 @@ namespace Oxide.Plugins
                 {
                     if (id.userid.IsSteamId())
                     {
-                        isAuthorized = _true;
+                        isAuthorized = true;
                         return;
                     }
                 }
-                
+
                 var attachedWeapon = turret.GetAttachedWeapon();
 
                 if (!attachedWeapon.IsValid())
@@ -1587,66 +1496,34 @@ namespace Oxide.Plugins
                 turret.Invoke(turret.UpdateTotalAmmo, 0.1f);
             }
 
-            private bool HasAmmo(ItemContainer container, ItemDefinition ammoType)
-            {
-                foreach (Item item in container.itemList)
-                {
-                    if (item.info == ammoType)
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
-            }
-
             private void FillAmmoGunTrap(GunTrap gt)
             {
-                if (gt.ammoType != null && gt.inventory.itemList.Count == 0)
+                if (gt.ammoType == null)
                 {
-                    Item item = ItemManager.Create(gt.ammoType, _config.Weapons.Ammo.GunTrap);
-
-                    if (!item.MoveToContainer(gt.inventory))
-                    {
-                        item.Remove();
-                    }
+                    return;
                 }
+
+                gt.inventory.AddItem(gt.ammoType, _config.Weapons.Ammo.GunTrap);
             }
 
             private void FillAmmoFogMachine(FogMachine fm)
             {
-                if (!fm.HasFuel())
+                if (lowgradefuel == null)
                 {
-                    var ammoType = ItemManager.FindItemDefinition("lowgradefuel");
-
-                    if (ammoType != null)
-                    {
-                        Item item = ItemManager.Create(ammoType, _config.Weapons.Ammo.FogMachine);
-
-                        if (!item.MoveToContainer(fm.inventory))
-                        {
-                            item.Remove();
-                        }
-                    }
+                    return;
                 }
+
+                fm.inventory.AddItem(lowgradefuel, _config.Weapons.Ammo.FogMachine);
             }
 
             private void FillAmmoFlameTurret(FlameTurret ft)
             {
-                if (!ft.HasFuel())
+                if (lowgradefuel == null)
                 {
-                    var ammoType = ItemManager.FindItemDefinition("lowgradefuel");
-
-                    if (ammoType != null)
-                    {
-                        Item item = ItemManager.Create(ammoType, _config.Weapons.Ammo.FlameTurret);
-
-                        if (!item.MoveToContainer(ft.inventory))
-                        {
-                            item.Remove();
-                        }
-                    }
+                    return;
                 }
+
+                ft.inventory.AddItem(lowgradefuel, _config.Weapons.Ammo.FlameTurret);
             }
 
             private void FillAmmoSamSite(SamSite ss)
@@ -1659,49 +1536,46 @@ namespace Oxide.Plugins
                     {
                         item.Remove();
                     }
+                    else ss.ammoItem = item;
+                }
+                else if (ss.ammoItem != null && ss.ammoItem.amount < _config.Weapons.Ammo.SamSite)
+                {
+                    ss.ammoItem.amount = _config.Weapons.Ammo.SamSite;
                 }
             }
 
-            private void OnWeaponItemAddedRemoved(Item item, bool bAdded)
+            private void OnWeaponItemPreRemove(Item item)
             {
-                if (bAdded || isAuthorized)
+                if (isAuthorized)
                 {
                     return;
                 }
 
-                foreach (var priv in privs)
+                if (priv != null && !priv.IsDestroyed)
                 {
-                    if (priv == null || priv.IsDestroyed)
-                    {
-                        continue;
-                    }
-
                     foreach (var id in priv.authorizedPlayers)
                     {
                         if (id.userid.IsSteamId())
                         {
-                            isAuthorized = _true;
+                            isAuthorized = true;
                             return;
                         }
                     }
                 }
 
-                weapons.RemoveAll(x => !x.IsValid() || x.IsDestroyed);
+                var weapon = item.parent?.entityOwner;
 
-                foreach (var weapon in weapons)
+                if (weapon is AutoTurret)
                 {
-                    if (weapon is AutoTurret)
-                    {
-                        weapon.Invoke(() => FillAmmoTurret(weapon as AutoTurret), 0.1f);
-                    }
-                    else if (weapon is GunTrap)
-                    {
-                        weapon.Invoke(() => FillAmmoGunTrap(weapon as GunTrap), 0.1f);
-                    }
-                    else if (weapon is SamSite)
-                    {
-                        weapon.Invoke(() => FillAmmoSamSite(weapon as SamSite), 0.1f);
-                    }
+                    weapon.Invoke(() => FillAmmoTurret(weapon as AutoTurret), 0.1f);
+                }
+                else if (weapon is GunTrap)
+                {
+                    weapon.Invoke(() => FillAmmoGunTrap(weapon as GunTrap), 0.1f);
+                }
+                else if (weapon is SamSite)
+                {
+                    weapon.Invoke(() => FillAmmoSamSite(weapon as SamSite), 0.1f);
                 }
             }
 
@@ -1720,8 +1594,7 @@ namespace Oxide.Plugins
             {
                 if (!bAdded)
                 {
-                //    StartTryToEnd();
-                return;
+                    StartTryToEnd();
                 }
             }
 
@@ -1739,7 +1612,7 @@ namespace Oxide.Plugins
                 if (IsOpened && IsLooted)
                 {
                     CancelInvoke(TryToEnd);
-                     AwardRaiders();
+                    AwardRaiders();
                     Undo();
                 }
             }
@@ -1756,7 +1629,7 @@ namespace Oxide.Plugins
 
                     player = BasePlayer.FindAwakeOrSleeping(playerId);
 
-                    if (player == null || player.IsFlying || !IsPlayerActive(player))
+                    if (player == null || player.IsFlying || !IsPlayerActive(player.UserIDString))
                     {
                         continue;
                     }
@@ -1785,7 +1658,7 @@ namespace Oxide.Plugins
                 sb.Length -= 2;
                 string thieves = sb.ToString();
                 string posStr = FormatGridReference(Location);
-                
+
                 Backbone.Plugin.Puts(Backbone.GetMessage("Thief", null, posStr, thieves));
 
                 if (_config.EventMessages.AnnounceThief)
@@ -1795,7 +1668,7 @@ namespace Oxide.Plugins
                         Backbone.Message(target, "Thief", target.UserIDString, posStr, thieves);
                     }
                 }
-                
+
                 Backbone.Plugin.SaveData();
             }
 
@@ -1818,14 +1691,14 @@ namespace Oxide.Plugins
                     if (Options.Rewards.Money > 0 && Backbone.Plugin.Economics != null && Backbone.Plugin.Economics.IsLoaded)
                     {
                         double money = _config.Settings.Management.DivideRewards ? Options.Rewards.Money / players.Count : Options.Rewards.Money;
-                        Backbone.Plugin.Economics.Call("Deposit", raider.UserIDString, money);
+                        Backbone.Plugin.Economics?.Call("Deposit", raider.UserIDString, money);
                         Backbone.Message(raider, "EconomicsDeposit", raider.UserIDString, money);
                     }
 
                     if (Options.Rewards.Points > 0 && Backbone.Plugin.ServerRewards != null && Backbone.Plugin.ServerRewards.IsLoaded)
                     {
                         int points = _config.Settings.Management.DivideRewards ? Options.Rewards.Points / players.Count : Options.Rewards.Points;
-                        Backbone.Plugin.ServerRewards.Call("AddPoints", raider.userID, points);
+                        Backbone.Plugin.ServerRewards?.Call("AddPoints", raider.userID, points);
                         Backbone.Message(raider, "ServerRewardPoints", raider.UserIDString, points);
                     }
                 }
@@ -1837,7 +1710,7 @@ namespace Oxide.Plugins
             {
                 if (messagesSent.Contains(player.UserIDString))
                 {
-                    return _false;
+                    return false;
                 }
 
                 string uid = player.UserIDString;
@@ -1845,7 +1718,7 @@ namespace Oxide.Plugins
                 messagesSent.Add(uid);
                 Backbone.Timer(10f, () => messagesSent.Remove(uid));
 
-                return _true;
+                return true;
             }
 
             private bool CanBypass(BasePlayer player)
@@ -1855,19 +1728,19 @@ namespace Oxide.Plugins
 
             public bool HasLockout(BasePlayer player)
             {
-                if (!player.IsValid() || CanBypass(player) || !_config.Settings.Management.Lockout.Any())
+                if (!_config.Settings.Management.Lockout.Any() || !player.IsValid() || CanBypass(player))
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (!IsOpened && Any(player.userID))
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (owner.IsValid() && player == owner)
                 {
-                    return _false;
+                    return false;
                 }
 
                 Lockout lo;
@@ -1882,21 +1755,16 @@ namespace Oxide.Plugins
                             Backbone.Message(player, "LockedOut", player.UserIDString, DifficultyMode, FormatTime(time));
                         }
 
-                        return _true;
+                        return true;
                     }
                 }
 
-                return _false;
+                return false;
             }
 
             private void TrySetLockout(string playerId)
             {
-                if (IsUnloading || Type == RaidableType.None)
-                {
-                    return;
-                }
-
-                if (Backbone.HasPermission(playerId, canBypassPermission))
+                if (IsUnloading || Type == RaidableType.None || Backbone.HasPermission(playerId, canBypassPermission))
                 {
                     return;
                 }
@@ -2086,7 +1954,7 @@ namespace Oxide.Plugins
                     IsPayLocked = true;
                     owner = player;
                     ownerId = player.UserIDString;
-                    friends.Add(player.userID);
+                    friends.Add(player);
                     ClearEnemies();
                 }
                 else if (!IsPlayerActive(ownerId))
@@ -2101,22 +1969,17 @@ namespace Oxide.Plugins
                 UpdateMarker();
             }
 
-            private bool IsPlayerActive(BasePlayer player)
-            {
-                return !player.IsValid() || IsPlayerActive(player.UserIDString);
-            }
-
             private bool IsPlayerActive(string playerId)
             {
                 if (_config.Settings.Management.LockTime <= 0f)
                 {
-                    return _true;
+                    return true;
                 }
 
                 float time;
                 if (!lastActive.TryGetValue(playerId, out time))
                 {
-                    return _true;
+                    return true;
                 }
 
                 return Time.realtimeSinceStartup - time <= _config.Settings.Management.LockTime * 60f;
@@ -2163,7 +2026,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                if (IsLootingWeapon(hitInfo) || Distance2D(attacker.transform.position, entity.transform.position) <= Options.ProtectionRadius)
+                if (IsLootingWeapon(hitInfo) || InRange(attacker.transform.position, entity.transform.position, Options.ProtectionRadius))
                 {
                     SetOwner(attacker);
                 }
@@ -2226,94 +2089,71 @@ namespace Oxide.Plugins
 
             public bool EndWhenCupboardIsDestroyed()
             {
-                if (_config.Settings.Management.EndWhenCupboardIsDestroyed && privAmountSpawned > 0)
+                if (_config.Settings.Management.EndWhenCupboardIsDestroyed && privSpawned)
                 {
-                    if (privs.Count == 0)
-                    {
-                        return _true;
-                    }
-
-                    foreach (var priv in privs)
-                    {
-                        if (priv == null || priv.IsDestroyed)
-                        {
-                            return _true;
-                        }
-                    }
+                    return priv == null || priv.IsDestroyed;
                 }
 
-                return _false;
+                return false;
             }
 
             public bool CanUndo()
             {
                 if (EndWhenCupboardIsDestroyed())
                 {
-                    return _true;
+                    return true;
                 }
 
-                if (_config.Settings.Management.RequireCupboardLooted && privAmountSpawned > 0)
+                if (_config.Settings.Management.RequireCupboardLooted && privSpawned)
                 {
-                    foreach (var priv in privs)
-                    {
-                        if (priv == null || priv.IsDestroyed || priv?.inventory?.itemList?.Count == 0)
-                        {
-                            return _true;
-                        }
-                    }
-
-                    return _false;
+                    return priv == null || priv.IsDestroyed || priv?.inventory?.itemList?.Count == 0;
                 }
 
                 foreach (var container in _containers)
                 {
                     if (container?.inventory?.itemList?.Count > 0)
                     {
-                        return _false;
+                        return false;
                     }
                 }
 
-                return _true;
+                return true;
             }
 
             private bool CanPlayerBeLooted()
             {
-                if (!_config.Settings.Management.PlayersLootableInPVE && !AllowPVP)
+                if (!_config.Settings.Management.PlayersLootableInPVE && !AllowPVP || !_config.Settings.Management.PlayersLootableInPVP && AllowPVP)
                 {
-                    return _false;
-                }
-                else if (!_config.Settings.Management.PlayersLootableInPVP && AllowPVP)
-                {
-                    return _false;
+                    return false;
                 }
 
-                return _true;
+                return true;
             }
 
             private bool CanBeLooted(BasePlayer player, BaseEntity e)
             {
                 if (IsProtectedWeapon(e))
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (e is NPCPlayerCorpse)
                 {
-                    return _true;
+                    return true;
                 }
 
                 if (e is LootableCorpse)
                 {
                     if (CanBypass(player))
                     {
-                        return _true;
+                        return true;
                     }
 
                     var corpse = e as LootableCorpse;
 
                     if (!corpse.playerSteamID.IsSteamId() || corpse.playerSteamID == player.userID || corpse.playerName == player.displayName)
                     {
-                        return _true;
+                        return true;
                     }
 
                     return CanPlayerBeLooted();
@@ -2322,20 +2162,20 @@ namespace Oxide.Plugins
                 {
                     if (CanBypass(player))
                     {
-                        return _true;
+                        return true;
                     }
 
                     var container = e as DroppedItemContainer;
 
                     if (!container.playerSteamID.IsSteamId() || container.playerSteamID == player.userID || container.playerName == player.displayName)
                     {
-                        return _true;
+                        return true;
                     }
 
                     return CanPlayerBeLooted();
                 }
 
-                return _true;
+                return true;
             }
 
             public static bool IsProtectedWeapon(BaseEntity e)
@@ -2416,10 +2256,10 @@ namespace Oxide.Plugins
 
                 AddLooter(player);
 
- //               if (e is BoxStorage || e is BuildingPrivlidge)
- //               {
- //                   StartTryToEnd();
- //               }
+                if (e is BoxStorage || e is BuildingPrivlidge)
+                {
+                    StartTryToEnd();
+                }
             }
 
             private void StartPlayingWithFire()
@@ -2460,7 +2300,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                var fireball = GameManager.server.CreateEntity(Backbone.Path.Fireball, npc.transform.position + new Vector3(0f, 3f, 0f), Quaternion.identity, true) as FireBall;
+                var fireball = GameManager.server.CreateEntity(Backbone.Path.FireballSmall, npc.transform.position + new Vector3(0f, 3f, 0f), Quaternion.identity, true) as FireBall;
 
                 if (fireball == null)
                 {
@@ -2500,9 +2340,9 @@ namespace Oxide.Plugins
 
             public void DestroyInputs()
             {
-                foreach (var input in Inputs)
+                foreach (var input in Inputs.ToList())
                 {
-                    Destroy(input);
+                    Destroy(input.Value);
                 }
 
                 Inputs.Clear();
@@ -2532,10 +2372,15 @@ namespace Oxide.Plugins
 
             private void SetContainers()
             {
+                List<BaseEntity> entities;
+                if (!Backbone.Plugin.Bases.TryGetValue(BaseIndex, out entities))
+                {
+                    return;
+                }
+
                 Collider collider;
                 StorageContainer container;
                 int hits = Physics.OverlapSphereNonAlloc(PastedLocation, Radius, Vis.colBuffer, Layers.Mask.Deployed, QueryTriggerInteraction.Ignore);
-                var list = Backbone.Plugin.Bases[BaseIndex];
 
                 for (int i = 0; i < hits; i++)
                 {
@@ -2548,15 +2393,12 @@ namespace Oxide.Plugins
 
                     container = collider.ToBaseEntity() as StorageContainer;
 
-                    if (container == null || container.IsDestroyed)
+                    if (container == null || container.IsDestroyed || entities.Contains(container))
                     {
                         goto next;
                     }
 
-                    if (!list.Contains(container))
-                    {
-                        list.Add(container);
-                    }
+                    entities.Add(container);
 
                     next:
                     Vis.colBuffer[i] = null;
@@ -2671,7 +2513,7 @@ namespace Oxide.Plugins
 
                         if (e == null)
                         {
-                            return _false;
+                            return false;
                         }
 
                         e.OwnerID = 0;
@@ -2704,7 +2546,7 @@ namespace Oxide.Plugins
                     center.y += 6f;
                 }
 
-                return _true;
+                return true;
             }
 
             private void KillTrees()
@@ -2741,6 +2583,8 @@ namespace Oxide.Plugins
                         continue;
                     }
 
+                    Backbone.Plugin.RaidEntities[e] = this;
+
                     if (e.net.ID < NetworkID)
                     {
                         NetworkID = e.net.ID;
@@ -2753,75 +2597,80 @@ namespace Oxide.Plugins
                         SetupPickup(e as BaseCombatEntity);
                     }
 
-                    if (e is StorageContainer)
+                    if (e is IOEntity)
                     {
+                        if (e is ContainerIOEntity)
+                        {
+                            SetupIO(e as ContainerIOEntity);
+                        }
+
+                        if (e is AutoTurret)
+                        {
+                            SetupTurret(e as AutoTurret);
+                        }
+                        else if (e is Igniter)
+                        {
+                            SetupIgniter(e as Igniter);
+                        }
+                        else if (e is SamSite)
+                        {
+                            SetupSamSite(e as SamSite);
+                        }
+                        else if (e is TeslaCoil)
+                        {
+                            SetupTeslaCoil(e as TeslaCoil);
+                        }
+                        else if (e is SearchLight)
+                        {
+                            SetupSearchLight(e as SearchLight);
+                        }
+                        else if (e is CustomDoorManipulator)
+                        {
+                            doorControllers.Add(e as CustomDoorManipulator);
+                        }
+
+                        SetupIO(e as IOEntity);
+                    }
+                    else if (e is StorageContainer)
+                    {
+                        if (e is BaseOven)
+                        {
+                            ovens.Add(e as BaseOven);
+                        }
+                        else if (e is GunTrap)
+                        {
+                            SetupGunTrap(e as GunTrap);
+                        }
+                        else if (e is FogMachine)
+                        {
+                            SetupFogMachine(e as FogMachine);
+                        }
+                        else if (e is FlameTurret)
+                        {
+                            SetupFlameTurret(e as FlameTurret);
+                        }
+                        else if (e is VendingMachine)
+                        {
+                            SetupVendingMachine(e as VendingMachine);
+                        }
+                        else if (e is BuildingPrivlidge)
+                        {
+                            SetupBuildingPriviledge(e as BuildingPrivlidge);
+                        }
+
                         SetupContainer(e as StorageContainer);
                     }
-                    else if (e is ContainerIOEntity)
-                    {
-                        SetupIO(e as ContainerIOEntity);
-                    }
-                    else if (e is CustomDoorManipulator)
-                    {
-                        doorControllers.Add(e as CustomDoorManipulator);
-                    }
-
-                    if (e is BaseLock)
+                    else if (e is BaseLock)
                     {
                         SetupLock(e);
-                    }
-                    else if (e is VendingMachine)
-                    {
-                        SetupVendingMachine(e as VendingMachine);
-                    }
-
-                    if (e is BaseOven)
-                    {
-                        ovens.Add(e as BaseOven);
-                    }
-                    else if (e is SearchLight)
-                    {
-                        SetupSearchLight(e as SearchLight);
                     }
                     else if (e is BuildingBlock)
                     {
                         SetupBuildingBlock(e as BuildingBlock);
                     }
-                    else if (e is TeslaCoil)
-                    {
-                        SetupTeslaCoil(e as TeslaCoil);
-                    }
-                    else if (e is Igniter)
-                    {
-                        SetupIgniter(e as Igniter);
-                    }
-                    else if (e is AutoTurret)
-                    {
-                        SetupTurret(e as AutoTurret);
-                    }
-                    else if (e is GunTrap)
-                    {
-                        SetupGunTrap(e as GunTrap);
-                    }
-                    else if (e is FogMachine)
-                    {
-                        SetupFogMachine(e as FogMachine);
-                    }
-                    else if (e is FlameTurret)
-                    {
-                        SetupFlameTurret(e as FlameTurret);
-                    }
-                    else if (e is SamSite)
-                    {
-                        SetupSamSite(e as SamSite);
-                    }
                     else if (e is Door)
                     {
                         doors.Add(e as Door);
-                    }
-                    else if (e is BuildingPrivlidge)
-                    {
-                        SetupBuildingPriviledge(e as BuildingPrivlidge);
                     }
                     else if (e is SleepingBag)
                     {
@@ -2845,7 +2694,7 @@ namespace Oxide.Plugins
 
             private void SetupPickup(BaseCombatEntity e)
             {
-                e.pickup.enabled = _false;
+                e.pickup.enabled = false;
             }
 
             private void SetupContainer(StorageContainer container)
@@ -2919,8 +2768,106 @@ namespace Oxide.Plugins
 
             private void SetupIO(IOEntity io)
             {
-                io.UpdateHasPower(25, 1);
-                io.SetFlag(BaseEntity.Flags.Reserved8, true, false, true);
+                if (io is TeslaCoil)
+                {
+                    var tc = io as TeslaCoil;
+
+                    tc.UpdateHasPower(tc.ConsumptionAmount(), 0);
+                    tc.UpdateFromInput(25, 0);
+                }
+                else if (io is PowerCounter)
+                {
+                    var pc = io as PowerCounter;
+
+                    pc.UpdateHasPower(pc.ConsumptionAmount(), 0);
+                    pc.SetFlag(BaseEntity.Flags.Reserved2, true, false, false);
+                    pc.MarkDirty();
+                }
+                else if (io is PoweredRemoteControlEntity)
+                {
+                    var prce = io as PoweredRemoteControlEntity;
+
+                    prce.UpdateHasPower(25, 1);
+                }
+                else if (io is Elevator)
+                {
+                    var elevator = io as Elevator;
+
+                    if (elevator.previousPowerAmount != null)
+                    {
+                        for (int i = 0; i < elevator.previousPowerAmount.Length; i++)
+                        {
+                            elevator.UpdateHasPower(25, i);
+                        }
+                    }
+                }
+                else if (io is ElectricalBlocker)
+                {
+                    var eb = io as ElectricalBlocker;
+
+                    eb.SetFlag(BaseEntity.Flags.On, true, false, false);
+                    eb.UpdateFromInput(25, 0);
+                    eb.UpdateFromInput(25, 1);
+                    eb.UpdateHasPower(25, 1);
+                }
+                else if (io is ElectricalCombiner) 
+                {
+                    var ec = io as ElectricalCombiner;
+
+                    ec.UpdateHasPower(25, 1);
+                }
+                else if (io is ElectricalDFlipFlop)
+                {
+                    var edff = io as ElectricalDFlipFlop;
+
+                    edff.UpdateHasPower(25, 0);
+                }
+                else if (io is Igniter)
+                {
+                    var igniter = io as Igniter;
+
+                    igniter.UpdateHasPower(25, 1);
+                }
+                else if (io is Sprinkler)
+                {
+                    var sprinkler = io as Sprinkler;
+
+                    sprinkler.UpdateHasPower(25, 1);
+                }
+                else if (io is ANDSwitch)
+                {
+                    var ands = io as ANDSwitch;
+
+                    ands.UpdateFromInput(25, 0);
+                    ands.UpdateFromInput(25, 1);
+                    ands.UpdateHasPower(25, 1);
+                }
+                else if (io is StorageMonitor)
+                {
+                    var sm = io as StorageMonitor;
+
+                    sm.UpdateHasPower(25, 0);
+                }
+                else if (io is ORSwitch)
+                {
+                    var ors = io as ORSwitch;
+
+                    ors.UpdateFromInput(25, 0);
+                    ors.UpdateFromInput(25, 1);
+                    ors.UpdateHasPower(25, 1);
+                }
+                else if (io is XORSwitch)
+                {
+                    var xs = io as XORSwitch;
+
+                    xs.UpdateFromInput(25, 0);
+                    xs.UpdateFromInput(25, 1);
+                    xs.UpdateHasPower(25, 1);
+                }
+                else io.UpdateHasPower(25, 1);
+
+                io.SetFlag(IOEntity.Flag_HasPower, true, false, true);
+                io.SendNetworkUpdate();
             }
 
             private void SetupLock(BaseEntity e, bool justCreated = false)
@@ -3060,7 +3007,6 @@ namespace Oxide.Plugins
                 turret.sightRange = Options.AutoTurretSightRange;
                 turret.aimCone = Options.AutoTurretAimCone;
                 turrets.Add(turret);
-                weapons.Add(turret);
 
                 if (Options.RemoveTurretWeapon)
                 {
@@ -3089,21 +3035,19 @@ namespace Oxide.Plugins
                     }
                 }
 
-                turret.Invoke(() => FillAmmoTurret(turret), 0.2f);
                 turret.Invoke(turret.UpdateAttachedWeapon, 0.1f);
-                turret.Invoke(turret.InitiateStartup, 0.3f);
+                turret.Invoke(() => FillAmmoTurret(turret), 0.2f);
+                //turret.Invoke(turret.InitiateStartup, 0.3f);
                 turret.SetPeacekeepermode(false);
 
                 if (_config.Weapons.InfiniteAmmo.AutoTurret)
                 {
-                    turret.inventory.onItemAddedRemoved += new Action<Item, bool>(OnWeaponItemAddedRemoved);
+                    turret.inventory.onPreItemRemove += new Action<Item>(OnWeaponItemPreRemove);
                 }
             }
 
             private void SetupGunTrap(GunTrap gt)
             {
-                weapons.Add(gt);
-
                 if (_config.Weapons.Ammo.GunTrap > 0)
                 {
                     FillAmmoGunTrap(gt);
@@ -3111,14 +3055,12 @@ namespace Oxide.Plugins
 
                 if (_config.Weapons.InfiniteAmmo.GunTrap)
                 {
-                    gt.inventory.onItemAddedRemoved += new Action<Item, bool>(OnWeaponItemAddedRemoved);
+                    gt.inventory.onPreItemRemove += new Action<Item>(OnWeaponItemPreRemove);
                 }
             }
 
             private void SetupFogMachine(FogMachine fm)
             {
-                weapons.Add(fm);
-
                 if (_config.Weapons.Ammo.FogMachine > 0)
                 {
                     FillAmmoFogMachine(fm);
@@ -3129,7 +3071,15 @@ namespace Oxide.Plugins
                     fm.fuelPerSec = 0f;
                 }
 
-                fm.StartFogging();
+                if (_config.Weapons.FogMotion)
+                {
+                    fm.SetFlag(BaseEntity.Flags.Reserved7, true, false, true);
+                }
+                
+                fm.CancelInvoke(fm.CheckTrigger);
+                fm.SetFlag(BaseEntity.Flags.Reserved6, true, false, true);
+                fm.SetFlag(BaseEntity.Flags.Reserved8, true, false, true);
+                fm.SetFlag(BaseEntity.Flags.On, true, false, true);
             }
 
             private void SetupFlameTurret(FlameTurret ft)
@@ -3149,7 +3099,6 @@ namespace Oxide.Plugins
 
             private void SetupSamSite(SamSite ss)
             {
-                weapons.Add(ss);
                 SetupIO(ss);
 
                 if (_config.Weapons.SamSiteRepair > 0f)
@@ -3158,7 +3107,10 @@ namespace Oxide.Plugins
                     ss.InvokeRepeating(ss.SelfHeal, _config.Weapons.SamSiteRepair * 60f, _config.Weapons.SamSiteRepair * 60f);
                 }
 
-                ss.scanRadius = Mathf.Max(150f, Options.ProtectionRadius);
+                if (_config.Weapons.SamSiteRange > 0f)
+                {
+                    ss.scanRadius = _config.Weapons.SamSiteRange;
+                }
 
                 if (_config.Weapons.Ammo.SamSite > 0)
                 {
@@ -3167,7 +3119,7 @@ namespace Oxide.Plugins
 
                 if (_config.Weapons.InfiniteAmmo.SamSite)
                 {
-                    ss.inventory.onItemAddedRemoved += new Action<Item, bool>(OnWeaponItemAddedRemoved);
+                    ss.inventory.onPreItemRemove += new Action<Item>(OnWeaponItemPreRemove);
                 }
             }
 
@@ -3183,8 +3135,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                door.SetFlag(BaseEntity.Flags.Open, false, false, true);
-                door.SendNetworkUpdateImmediate();
+                door.SetOpen(false);
             }
 
             private void SetupDoors()
@@ -3278,8 +3229,8 @@ namespace Oxide.Plugins
                     priv.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
                 }
 
-                privs.Add(priv);
-                privAmountSpawned = privs.Count;
+                this.priv = priv;
+                privSpawned = true;
             }
 
             private void SetupSleepingBag(SleepingBag bag)
@@ -3408,14 +3359,14 @@ namespace Oxide.Plugins
                         Subscribe(nameof(CanBeTargeted));
                     }
 
+                    Subscribe(nameof(OnNpcKits));
                     Subscribe(nameof(OnNpcTarget));
-                    Subscribe(nameof(OnPlayerCorpseSpawned));
                     SetupNpcKits();
-                    //Invoke(SpawnNpcs, 1f);
+                    Invoke(SpawnNpcs, 1f);
                 }
 
                 Subscribe(nameof(OnPlayerDeath));
-                Subscribe(nameof(OnPlayerHealthChange));
+                Subscribe(nameof(OnPlayerDropActiveItem));
                 Subscribe(nameof(OnEntityDeath));
                 Subscribe(nameof(OnEntityKill));
 
@@ -3425,11 +3376,7 @@ namespace Oxide.Plugins
                     Subscribe(nameof(canTeleport));
                 }
 
-                if (_config.Settings.Management.BlockRestorePVP && AllowPVP)
-                {
-                    Subscribe(nameof(OnRestoreUponDeath));
-                }
-                else if (_config.Settings.Management.BlockRestorePVE && !AllowPVP)
+                if (_config.Settings.Management.BlockRestorePVP && AllowPVP || _config.Settings.Management.BlockRestorePVE && !AllowPVP)
                 {
                     Subscribe(nameof(OnRestoreUponDeath));
                 }
@@ -3450,6 +3397,16 @@ namespace Oxide.Plugins
                 if (!_config.Settings.Management.BackpacksOpenPVP || !_config.Settings.Management.BackpacksOpenPVE)
                 {
                     Subscribe(nameof(CanOpenBackpack));
+                }
+
+                if (_config.Settings.Management.PreventFireFromSpreading)
+                {
+                    Subscribe(nameof(OnFireBallSpread));
+                }
+
+                if (!_config.Settings.Management.AllowBuilding)
+                {
+                    Subscribe(nameof(CanBuild));
                 }
 
                 Subscribe(nameof(CanDropBackpack));
@@ -3489,7 +3446,7 @@ namespace Oxide.Plugins
                 foreach (var target in BasePlayer.activePlayerList)
                 {
                     float distance = Mathf.Floor((target.transform.position - Location).magnitude);
-                    string flag = Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag").Replace("[", string.Empty).Replace("]", string.Empty);
+                    string flag = Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag", target.UserIDString).Replace("[", string.Empty).Replace("] ", string.Empty);
                     string api = Backbone.GetMessage("RaidOpenMessage", target.UserIDString, DifficultyMode, posStr, distance, flag);
                     if (Type == RaidableType.None) api = api.Replace(DifficultyMode, NoMode);
                     string message = owner.IsValid() ? string.Format("{0}[Owner: {1}]", api, owner.displayName) : api;
@@ -3501,7 +3458,7 @@ namespace Oxide.Plugins
 
                     if (_config.GUIAnnouncement.Enabled && Backbone.Plugin.GUIAnnouncements != null && Backbone.Plugin.GUIAnnouncements.IsLoaded && distance <= _config.GUIAnnouncement.Distance)
                     {
-                        Backbone.Plugin.GUIAnnouncements.Call("CreateAnnouncement", message, _config.GUIAnnouncement.TintColor, _config.GUIAnnouncement.TextColor, target);
+                        Backbone.Plugin.GUIAnnouncements?.Call("CreateAnnouncement", message, _config.GUIAnnouncement.TintColor, _config.GUIAnnouncement.TextColor, target);
                     }
                 }
             }
@@ -3521,7 +3478,7 @@ namespace Oxide.Plugins
 
             public void TryInvokeResetPayLock()
             {
-                if (_config.Settings.Buyable.ResetDuration > 0)
+                if (_config.Settings.Buyable.ResetDuration > 0 && IsPayLocked && IsOpened)
                 {
                     CancelInvoke(ResetPayLock);
                     Invoke(ResetPayLock, _config.Settings.Buyable.ResetDuration * 60f);
@@ -3689,7 +3646,7 @@ namespace Oxide.Plugins
                         } while (Loot.Count < Options.TreasureAmount);
                     }
                 }
-                else Loot = new List<TreasureItem>(Loot.Distinct(itemComparer));
+                else Loot = new List<TreasureItem>(Loot.Distinct(Backbone.Plugin.itemComparer));
 
                 if (Loot.Count > Options.TreasureAmount)
                 {
@@ -3810,7 +3767,7 @@ namespace Oxide.Plugins
 
                     int amount = lootItem.amount;
 
-                    if (lootItem.amountMin != lootItem.amount && lootItem.amountMin < lootItem.amount)
+                    if (lootItem.amountMin < lootItem.amount)
                     {
                         amount = UnityEngine.Random.Range(lootItem.amountMin, lootItem.amount + 1);
                     }
@@ -3821,7 +3778,7 @@ namespace Oxide.Plugins
                         continue;
                     }
 
-                    amount = GetPercentIncreasedAmount(amount);
+                    amount = GetPercentAmount(amount);
 
                     if (amount <= 0)
                     {
@@ -3892,7 +3849,7 @@ namespace Oxide.Plugins
             {
                 if (!_config.Settings.Management.Food || _allcontainers.Count == 0 || item.info.category != ItemCategory.Food || !IsCooked(item.info))
                 {
-                    return _false;
+                    return false;
                 }
 
                 StorageContainer container = null;
@@ -3913,17 +3870,17 @@ namespace Oxide.Plugins
 
                 if (container.IsValid() && item.MoveToContainer(container.inventory, -1, true))
                 {
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             private bool MoveToBBQ(Item item)
             {
                 if (!_config.Settings.Management.Food || ovens.Count == 0 || item.info.category != ItemCategory.Food || IsCooked(item.info))
                 {
-                    return _false;
+                    return false;
                 }
 
                 BaseOven oven = null;
@@ -3944,27 +3901,25 @@ namespace Oxide.Plugins
 
                 if (oven.IsValid() && item.MoveToContainer(oven.inventory, -1, true))
                 {
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             private bool MoveToCupboard(Item item)
             {
-                if (!_config.Settings.Management.Cupboard || privs.Count == 0 || item.info.category != ItemCategory.Resources || IsCooked(item.info))
+                if (!_config.Settings.Management.Cupboard || !privSpawned || item.info.category != ItemCategory.Resources || IsCooked(item.info))
                 {
-                    return _false;
+                    return false;
                 }
-
-                var priv = privs.GetRandom();
 
                 if (priv != null && !priv.IsDestroyed && priv.inventory != null)
                 {
                     return item.MoveToContainer(priv.inventory, -1, true);
                 }
 
-                return _false;
+                return false;
             }
 
             private bool IsCooked(ItemDefinition def)
@@ -3976,7 +3931,7 @@ namespace Oxide.Plugins
             {
                 if (IsCooked(def) || def.shortname == "lowgradefuel")
                 {
-                    return _false;
+                    return false;
                 }
 
                 return def.GetComponent<ItemModCookable>() || def.GetComponent<ItemModBurnable>();
@@ -3986,7 +3941,7 @@ namespace Oxide.Plugins
             {
                 if (!_config.Settings.Management.Cook || ovens.Count == 0 || !IsCookable(item.info))
                 {
-                    return _false;
+                    return false;
                 }
 
                 BaseOven oven = null;
@@ -4018,10 +3973,10 @@ namespace Oxide.Plugins
                         item.MarkDirty();
                     }
 
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             private void CheckExpansionSettings()
@@ -4043,7 +3998,7 @@ namespace Oxide.Plugins
 
                 if (boxes.Count > 0)
                 {
-                    Backbone.Plugin.DangerousTreasures.Call("API_SetContainer", boxes.GetRandom(), Radius, !Options.NPC.Enabled || Options.NPC.UseExpansionNpcs);
+                    Backbone.Plugin.DangerousTreasures?.Call("API_SetContainer", boxes.GetRandom(), Radius, !Options.NPC.Enabled || Options.NPC.UseExpansionNpcs);
                     boxes.Clear();
                 }
 
@@ -4156,7 +4111,7 @@ namespace Oxide.Plugins
             {
                 if (IsOpened)
                 {
-                    IsOpened = _false;
+                    IsOpened = false;
                     CancelInvoke(ResetOwner);
                     Backbone.Plugin.UndoPaste(Location, this, BaseIndex);
                 }
@@ -4168,14 +4123,14 @@ namespace Oxide.Plugins
 
                 if (ownerId == targetIdString)
                 {
-                    return _true;
+                    return true;
                 }
 
                 foreach (var x in raiders)
                 {
                     if (x == targetIdString)
                     {
-                        return _true;
+                        return true;
                     }
                 }
 
@@ -4185,20 +4140,20 @@ namespace Oxide.Plugins
                     {
                         if (x?.userID == targetId)
                         {
-                            return _true;
+                            return true;
                         }
                     }
 
                     foreach (var x in friends)
                     {
-                        if (x == targetId)
+                        if (x?.userID == targetId)
                         {
-                            return _true;
+                            return true;
                         }
                     }
                 }
 
-                return _false;
+                return false;
             }
 
             public static bool Any(BasePlayer player)
@@ -4207,55 +4162,26 @@ namespace Oxide.Plugins
                 {
                     if (raid.owner.IsValid() && raid.owner == player)
                     {
-                        return _true;
+                        return true;
                     }
                 }
 
-                return _false;
+                return false;
+            }
+
+            public static bool Has(ulong userID)
+            {
+                return Backbone.Plugin.Npcs.ContainsKey(userID);
             }
 
             public static bool Has(BaseEntity entity)
             {
-                foreach (var entry in Backbone.Plugin.Bases)
-                {
-                    if (entry.Value.Contains(entity))
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
+                return Backbone.Plugin.RaidEntities.ContainsKey(entity);
             }
 
             public static bool Has(NPCPlayerApex npc)
             {
-                if (!npc.IsValid())
-                {
-                    return _false;
-                }
-
-                foreach (var raid in Backbone.Plugin.Raids.Values)
-                {
-                    if (raid.HasNPC(npc.userID))
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
-            }
-
-            public bool HasNPC(ulong userID)
-            {
-                foreach (var npc in npcs)
-                {
-                    if (npc?.userID == userID)
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
+                return npc.IsValid() && Has(npc.userID);
             }
 
             public static int Get(RaidableType type)
@@ -4290,15 +4216,9 @@ namespace Oxide.Plugins
 
             public static RaidableBase Get(ulong userID)
             {
-                foreach (var raid in Backbone.Plugin.Raids.Values)
+                if (Backbone.Plugin.Npcs.ContainsKey(userID))
                 {
-                    foreach (var npc in raid.npcs)
-                    {
-                        if (npc.userID == userID)
-                        {
-                            return raid;
-                        }
-                    }
+                    return Backbone.Plugin.Npcs[userID];
                 }
 
                 return null;
@@ -4308,7 +4228,7 @@ namespace Oxide.Plugins
             {
                 foreach (var raid in Backbone.Plugin.Raids.Values)
                 {
-                    if (Distance2D(raid.Location, target) <= raid.Options.ProtectionRadius)
+                    if (InRange(raid.Location, target, raid.Options.ProtectionRadius))
                     {
                         return raid;
                     }
@@ -4319,12 +4239,9 @@ namespace Oxide.Plugins
 
             public static RaidableBase Get(int baseIndex)
             {
-                foreach (var raid in Backbone.Plugin.Raids.Values)
+                if (Backbone.Plugin.Indices.ContainsKey(baseIndex))
                 {
-                    if (raid.BaseIndex == baseIndex)
-                    {
-                        return raid;
-                    }
+                    return Backbone.Plugin.Indices[baseIndex];
                 }
 
                 return null;
@@ -4332,12 +4249,9 @@ namespace Oxide.Plugins
 
             public static RaidableBase Get(BaseEntity entity)
             {
-                foreach (var entry in Backbone.Plugin.Bases)
+                if (Backbone.Plugin.RaidEntities.ContainsKey(entity))
                 {
-                    if (entry.Value.Contains(entity))
-                    {
-                        return Get(entry.Key);
-                    }
+                    return Backbone.Plugin.RaidEntities[entity];
                 }
 
                 return null;
@@ -4345,21 +4259,13 @@ namespace Oxide.Plugins
 
             public static RaidableBase Get(List<BaseEntity> entities)
             {
-                if (entities == null || entities.Count == 0)
-                {
-                    return null;
-                }
+                entities.RemoveAll(e => e == null || e.IsDestroyed || e.transform == null);
 
                 foreach (var raid in Backbone.Plugin.Raids.Values)
                 {
                     foreach (var e in entities)
                     {
-                        if (e == null || e.IsDestroyed || e.transform == null)
-                        {
-                            continue;
-                        }
-
-                        if (Distance2D(raid.PastedLocation, e.transform.position) <= raid.Radius)
+                        if (InRange(raid.PastedLocation, e.transform.position, Radius))
                         {
                             return raid;
                         }
@@ -4369,35 +4275,17 @@ namespace Oxide.Plugins
                 return null;
             }
 
-            public static bool IsEntity(BaseEntity entity)
-            {
-                foreach (var raid in Backbone.Plugin.Raids.Values)
-                {
-                    if (IsEntity(entity, raid.BaseIndex) || raid.BuiltList.Contains(entity.net.ID))
-                    {
-                        return _true;
-                    }
-                }
-
-                return _false;
-            }
-
-            public static bool IsEntity(BaseEntity entity, int baseIndex)
-            {
-                return Backbone.Plugin.Bases.ContainsKey(baseIndex) && Backbone.Plugin.Bases[baseIndex].Contains(entity);
-            }
-
             public static bool IsTooClose(Vector3 target, float radius)
             {
                 foreach (var raid in Backbone.Plugin.Raids.Values)
                 {
-                    if (Distance2D(raid.Location, target) <= radius)
+                    if (InRange(raid.Location, target, radius))
                     {
-                        return _true;
+                        return true;
                     }
                 }
 
-                return _false;
+                return false;
             }
 
             private List<ulong> GetItemSkins(ItemDefinition def)
@@ -4449,33 +4337,30 @@ namespace Oxide.Plugins
                     turret.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
                 }
 
-                foreach (var priv in privs)
+                if (priv == null || priv.IsDestroyed)
                 {
-                    if (priv == null || priv.IsDestroyed)
-                    {
-                        continue;
-                    }
-
-                    priv.authorizedPlayers.Add(new ProtoBuf.PlayerNameID
-                    {
-                        userid = npc.userID,
-                        username = npc.displayName
-                    });
-
-                    priv.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+                    return;
                 }
+
+                priv.authorizedPlayers.Add(new ProtoBuf.PlayerNameID
+                {
+                    userid = npc.userID,
+                    username = npc.displayName
+                });
+
+                priv.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
             }
 
             public bool IsInSameClan(string playerId, string targetId)
             {
                 if (playerId == targetId)
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (Backbone.Plugin.Clans == null || !Backbone.Plugin.Clans.IsLoaded)
                 {
-                    return _false;
+                    return false;
                 }
 
                 var clan = new List<string>();
@@ -4494,18 +4379,18 @@ namespace Oxide.Plugins
                     }
                 }
 
-                string playerClan = Backbone.Plugin.Clans.Call<string>("GetClanOf", playerId);
+                string playerClan = Backbone.Plugin.Clans?.Call("GetClanOf", playerId) as string;
 
                 if (string.IsNullOrEmpty(playerClan))
                 {
-                    return _false;
+                    return false;
                 }
 
-                string targetClan = Backbone.Plugin.Clans.Call<string>("GetClanOf", targetId);
+                string targetClan = Backbone.Plugin.Clans?.Call("GetClanOf", targetId) as string;
 
                 if (string.IsNullOrEmpty(targetClan))
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (playerClan == targetClan)
@@ -4517,10 +4402,10 @@ namespace Oxide.Plugins
 
                     clan.Add(playerId);
                     clan.Add(targetId);
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             public void UpdateClans(string clan)
@@ -4545,12 +4430,12 @@ namespace Oxide.Plugins
             {
                 if (playerId == targetId)
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (Backbone.Plugin.Friends == null || !Backbone.Plugin.Friends.IsLoaded)
                 {
-                    return _false;
+                    return false;
                 }
 
                 List<string> targetList;
@@ -4561,35 +4446,37 @@ namespace Oxide.Plugins
 
                 if (targetList.Contains(playerId))
                 {
-                    return _true;
+                    return true;
                 }
 
-                if (Backbone.Plugin.Friends.Call<bool>("AreFriends", playerId, targetId))
+                var success = Backbone.Plugin.Friends?.Call("AreFriends", playerId, targetId);
+
+                if (success is bool && (bool)success)
                 {
                     targetList.Add(playerId);
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             public bool IsOnSameTeam(ulong playerId, ulong targetId)
             {
                 if (playerId == targetId)
                 {
-                    return _false;
+                    return false;
                 }
 
                 RelationshipManager.PlayerTeam team1;
                 if (!RelationshipManager.Instance.playerToTeam.TryGetValue(playerId, out team1))
                 {
-                    return _false;
+                    return false;
                 }
 
                 RelationshipManager.PlayerTeam team2;
                 if (!RelationshipManager.Instance.playerToTeam.TryGetValue(targetId, out team2))
                 {
-                    return _false;
+                    return false;
                 }
 
                 return team1.teamID == team2.teamID;
@@ -4602,9 +4489,9 @@ namespace Oxide.Plugins
 
             public bool IsAlly(BasePlayer player)
             {
-                if (!owner.IsValid() || !owner.IsConnected || CanBypass(player) || player.UserIDString == ownerId || friends.Contains(player.userID))
+                if (!owner.IsValid() || !owner.IsConnected || CanBypass(player) || player.UserIDString == ownerId || friends.Contains(player))
                 {
-                    return _true;
+                    return true;
                 }
 
                 return IsOwnerAlly(player);
@@ -4614,11 +4501,11 @@ namespace Oxide.Plugins
             {
                 if (IsOnSameTeam(player.userID, owner.userID) || IsInSameClan(player.UserIDString, owner.UserIDString) || IsFriends(player.UserIDString, owner.UserIDString))
                 {
-                    friends.Add(player.userID);
-                    return _true;
+                    friends.Add(player);
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             public static void StopUsingWand(BasePlayer player)
@@ -4667,10 +4554,12 @@ namespace Oxide.Plugins
 
             public void AddCorpse(PlayerCorpse corpse, BasePlayer player)
             {
-                if (!corpses.ContainsKey(corpse))
+                if (!Options.EjectCorpses || corpses.ContainsKey(corpse))
                 {
-                    corpses.Add(corpse, player);
+                    return;
                 }
+
+                corpses.Add(corpse, player);
             }
 
             public void EjectCorpse(BasePlayer player, PlayerCorpse corpse)
@@ -4682,6 +4571,7 @@ namespace Oxide.Plugins
 
                 var position = GetEjectLocation(corpse.transform.position, 5f);
                 float w = TerrainMeta.WaterMap.GetHeight(position);
+
                 if (position.y < w) position.y = w;
 
                 var container = ItemContainer.Drop(StringPool.Get(1519640547), position, Quaternion.identity, corpse.containers);
@@ -4704,10 +4594,10 @@ namespace Oxide.Plugins
                     if (_config.Settings.Management.DrawTime <= 0)
                     {
                         Backbone.Message(player, "YourCorpse", player.UserIDString);
+                        corpses.Remove(corpse);
                         return;
                     }
 
-                    string message = Backbone.GetMessage("YourCorpse", player.UserIDString);
                     bool isAdmin = player.IsAdmin;
 
                     try
@@ -4718,7 +4608,12 @@ namespace Oxide.Plugins
                             player.SendNetworkUpdateImmediate();
                         }
 
-                        player.SendConsoleCommand("ddraw.text", _config.Settings.Management.DrawTime, Color.red, container.transform.position, message);
+                        player.SendConsoleCommand("ddraw.text", _config.Settings.Management.DrawTime, Color.red, container.transform.position, Backbone.GetMessage("YourCorpse", player.UserIDString));
+                    }
+                    catch (Exception ex)
+                    {
+                        Backbone.Plugin.Puts(ex.StackTrace);
+                        Backbone.Plugin.Puts(ex.Message);
                     }
                     finally
                     {
@@ -4728,8 +4623,9 @@ namespace Oxide.Plugins
                             player.SendNetworkUpdateImmediate();
                         }
                     }
-
                 }
+
+                corpses.Remove(corpse);
             }
 
             private void EjectSleepers()
@@ -4773,7 +4669,7 @@ namespace Oxide.Plugins
 
                 if (player.isMounted)
                 {
-                    TryRemoveMountable(player.GetMounted());
+                    RemoveMountable(player.GetMounted());
                     return;
                 }
 
@@ -4784,6 +4680,7 @@ namespace Oxide.Plugins
                     position.y = player.transform.position.y;
                 }
 
+                player.EnsureDismounted();
                 player.Teleport(position);
                 player.SendNetworkUpdateImmediate();
             }
@@ -4804,7 +4701,7 @@ namespace Oxide.Plugins
             {
                 if (Type == RaidableType.None || target == null || target == owner)
                 {
-                    return _false;
+                    return false;
                 }
 
                 if (Backbone.HasPermission(target.UserIDString, banPermission))
@@ -4814,79 +4711,115 @@ namespace Oxide.Plugins
                         Backbone.Message(target, "Banned", target.UserIDString);
                     }
 
-                    return _true;
+                    return true;
                 }
                 else if (HasLockout(target) || IsHogging(target))
                 {
-                    return _true;
+                    return true;
                 }
                 else if (CanEject() && !IsAlly(target))
                 {
-                    return _true;
+                    return true;
                 }
                 else if (_config.Settings.Management.EjectSleepers && target.IsSleeping() && !target.IsConnected && Type != RaidableType.None)
                 {
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             public bool CanEject()
             {
                 if (IsPayLocked && AllowPVP && Options.EjectPurchasedPVP)
                 {
-                    return _true;
+                    return true;
                 }
 
                 if (IsPayLocked && !AllowPVP && Options.EjectPurchasedPVE)
                 {
-                    return _true;
+                    return true;
                 }
 
                 if (AllowPVP && Options.EjectLockedPVP && owner.IsValid())
                 {
-                    return _true;
+                    return true;
                 }
 
                 if (!AllowPVP && Options.EjectLockedPVE && owner.IsValid())
                 {
-                    return _true;
+                    return true;
                 }
 
-                return _false;
+                return false;
             }
 
             private bool TryRemoveMountable(BaseMountable m)
             {
+                if (CanEject(m))
+                {
+                    return RemoveMountable(m);
+                }
+
+                if (_config.Settings.Management.Mounts.Owner && !m.OwnerID.IsSteamId())
+                {
+                    return RemoveMountable(m);
+                }
+
+                if (_config.Settings.Management.Mounts.Boats && m is BaseBoat)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.BasicCars && m is BasicCar)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.ModularCars && m is ModularCar)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.CH47 && m is CH47Helicopter)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.Horses && m is RidableHorse)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.Scrap && m is ScrapTransportHelicopter)
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.MiniCopters && m is MiniCopter && !(m is ScrapTransportHelicopter))
+                {
+                    return RemoveMountable(m);
+                }
+                else if (_config.Settings.Management.Mounts.Pianos && m is StaticInstrument)
+                {
+                    return RemoveMountable(m);
+                }
+                
                 var players = GetMountedPlayers(m);
 
                 foreach (var player in players)
                 {
-                    if (player.IsValid())
+                    if (CanEject(player))
                     {
-                        if (CanEject(player))
-                        {
-                            RemoveMountable(m);
-                            return _true;
-                        }
-                    }
-                    else if (!m.OwnerID.IsSteamId() || CanEject(m))
-                    {
-                        RemoveMountable(m);
-                        return _true;
+                        return RemoveMountable(m);
                     }
                 }
 
-                return _false;
+                return false;
             }
 
-            private void RemoveMountable(BaseMountable m)
+            private bool RemoveMountable(BaseMountable m)
             {
-                if (Distance2D(m.transform.position, Location) < Radius || m is ScrapTransportHelicopter)
+                bool flag = m is MiniCopter || m is CH47Helicopter;
+
+                if (InRange(m.transform.position, Location, Radius, false))
                 {
-                    EjectMountable(m);
-                    return;
+                    EjectMountable(m, flag);
+                    return true;
                 }
 
                 var e = m.transform.eulerAngles; // credits k1lly0u
@@ -4904,30 +4837,35 @@ namespace Oxide.Plugins
                     rigidBody.velocity *= -1f;
                 }
 
-                if (m is BaseBoat)
+                if (flag || m is BaseBoat || m is StaticInstrument)
                 {
-                    EjectMountable(m);
+                    EjectMountable(m, flag);
                 }
+
+                return true;
             }
 
-            private void EjectMountable(BaseMountable m)
+            private void EjectMountable(BaseMountable m, bool flag)
             {
                 var position = ((m.transform.position.XZ3D() - Location.XZ3D()).normalized * (Options.ProtectionRadius + 10f)) + Location; // credits k1lly0u
                 float y = TerrainMeta.HighestPoint.y + 250f;
-
-                RaycastHit hit;
-                if (Physics.Raycast(position + new Vector3(0f, y, 0f), Vector3.down, out hit, position.y + y + 1f, targetLayer, QueryTriggerInteraction.Ignore))
+                
+                if (!flag)
                 {
-                    position.y = hit.point.y;
+                    RaycastHit hit;
+                    if (Physics.Raycast(position + new Vector3(0f, y, 0f), Vector3.down, out hit, position.y + y + 1f, targetLayer, QueryTriggerInteraction.Ignore))
+                    {
+                        position.y = hit.point.y;
+                    }
+                    else position.y = GetSpawnHeight(position);
                 }
-                else position.y = GetSpawnHeight(position);
 
                 if (m.transform.position.y > position.y)
                 {
                     position.y = m.transform.position.y;
                 }
 
-                if (m is MiniCopter)
+                if (flag)
                 {
                     m.transform.position = position;
                 }
@@ -4947,7 +4885,12 @@ namespace Oxide.Plugins
                         e.enableSaving = false;
                     }
 
-                    return _false;
+                    if (Backbone.Plugin.Bases.ContainsKey(BaseIndex))
+                    {
+                        Backbone.Plugin.Bases[BaseIndex].Remove(e);
+                    }
+
+                    return false;
                 }
 
                 if (e.net == null)
@@ -4957,29 +4900,29 @@ namespace Oxide.Plugins
 
                 e.enableSaving = false;
 
-                return _true;
+                return true;
             }
 
             public void RespawnNpc()
             {
-                if (!IsOpened || IsInvoking(() => RespawnNpcNow(true)))
+                if (IsInvoking(RespawnNpcNow) || !IsOpened && !Options.Levels.Level2)
                 {
                     return;
                 }
 
-                Invoke(() => RespawnNpcNow(true), Mathf.Max(1f, Options.RespawnRate));
+                Invoke(RespawnNpcNow, Mathf.Max(1f, Options.RespawnRate));
             }
 
-            public void RespawnNpcNow(bool flag)
+            public void RespawnNpcNow()
             {
-                if (!IsOpened)
+                if (!IsOpened && !Options.Levels.Level2)
                 {
                     return;
                 }
 
                 SpawnNPC(Options.NPC.SpawnScientistsOnly ? false : Options.NPC.SpawnBoth ? UnityEngine.Random.value > 0.5f : Options.NPC.SpawnMurderers);
 
-                if (flag && npcs.Count < npcSpawnedAmount)
+                if (npcs.Count < npcSpawnedAmount)
                 {
                     RespawnNpc();
                 }
@@ -5016,7 +4959,7 @@ namespace Oxide.Plugins
 
                         foreach (var a in foundations)
                         {
-                            if (Distance2D(a, navHit.position) <= 1f)
+                            if (InRange(a, navHit.position, 1f))
                             {
                                 flag = true;
                                 break;
@@ -5115,14 +5058,7 @@ namespace Oxide.Plugins
                 get
                 {
                     var list = new List<Vector3>();
-                    //float maxRoamRange = Mathf.Max(Radius * 2f, Mathf.Max(Options.ArenaWalls.Radius, Options.ProtectionRadius) - 5f);
-
-                    float maxRoamRange = Mathf.Max(Radius * 2f, Options.ProtectionRadius);
-
-                    if (Options.ArenaWalls.Enabled)
-                    {
-                        maxRoamRange = 20f;
-                    }
+                    float maxRoamRange = Options.ArenaWalls.Enabled ? 20f : Mathf.Max(Radius * 2f, Options.ProtectionRadius);
 
                     for (int i = 0; i < 10; i++)
                     {
@@ -5209,6 +5145,7 @@ namespace Oxide.Plugins
                 npcs.Add(npc);
                 AuthorizePlayer(npc);
                 npc.Invoke(() => UpdateDestination(npc, list), 0.25f);
+                Backbone.Plugin.Npcs[npc.userID] = this;
 
                 return npc;
             }
@@ -5243,7 +5180,14 @@ namespace Oxide.Plugins
 
             private bool IsKit(string kit)
             {
-                return Backbone.Plugin.Kits != null && Backbone.Plugin.Kits.IsLoaded && Backbone.Plugin.Kits.Call<bool>("isKit", kit);
+                var success = Backbone.Plugin.Kits?.Call("isKit", kit);
+
+                if (success == null || !(success is bool))
+                {
+                    return false;
+                }
+
+                return (bool)success;
             }
 
             private void EquipNpc(NPCPlayerApex npc, bool murd)
@@ -5253,7 +5197,7 @@ namespace Oxide.Plugins
                 {
                     npc.inventory.Strip();
 
-                    object success = Backbone.Plugin.Kits.Call("GiveKit", npc, kits.GetRandom());
+                    object success = Backbone.Plugin.Kits?.Call("GiveKit", npc, kits.GetRandom());
 
                     if (success is bool && (bool)success)
                     {
@@ -5347,7 +5291,7 @@ namespace Oxide.Plugins
                     float seconds = despawnTime - Time.realtimeSinceStartup;
                     string despawnText = _config.Settings.Management.DespawnMinutesInactive > 0 && seconds > 0 ? Math.Floor(TimeSpan.FromSeconds(seconds).TotalMinutes).ToString() : null;
                     string flag = Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag");
-                    string markerShopName = markerName == _config.Settings.Markers.MarkerName ? string.Format("{0}{1} {2}", flag, Mode(), markerName) : string.Format("{0} {1}", Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag"), markerName).TrimStart();
+                    string markerShopName = markerName == _config.Settings.Markers.MarkerName ? string.Format("{0}{1} {2}", flag, Mode(), markerName) : string.Format("{0} {1}", flag, markerName).TrimStart();
                     vendingMarker.markerShopName = string.IsNullOrEmpty(despawnText) ? markerShopName : string.Format("{0} [{1}m]", markerShopName, despawnText);
                     vendingMarker.SendNetworkUpdate();
                 }
@@ -5375,7 +5319,8 @@ namespace Oxide.Plugins
 
                     if (vendingMarker != null)
                     {
-                        string markerShopName = markerName == _config.Settings.Markers.MarkerName ? string.Format("{0}{1} {2}", Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag"), Mode(), markerName) : string.Format("{0}{1}", Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag"), markerName);
+                        string flag = Backbone.GetMessage(AllowPVP ? "PVPFlag" : "PVEFlag");
+                        string markerShopName = markerName == _config.Settings.Markers.MarkerName ? string.Format("{0}{1} {2}", flag, Mode(), markerName) : string.Format("{0}{1}", flag, markerName);
 
                         vendingMarker.enabled = false;
                         vendingMarker.markerShopName = markerShopName;
@@ -5487,7 +5432,7 @@ namespace Oxide.Plugins
                                 return color;
                             }
                         }
-                        
+
                         return Color.green;
                     case RaidableMode.Medium:
                         {
@@ -5539,7 +5484,7 @@ namespace Oxide.Plugins
                         {
                             if (!_config.Settings.Markers.Manual)
                             {
-                                return _false;
+                                return false;
                             }
 
                             break;
@@ -5548,7 +5493,7 @@ namespace Oxide.Plugins
                         {
                             if (!_config.Settings.Markers.Maintained)
                             {
-                                return _false;
+                                return false;
                             }
 
                             break;
@@ -5557,7 +5502,7 @@ namespace Oxide.Plugins
                         {
                             if (!_config.Settings.Markers.Buyables)
                             {
-                                return _false;
+                                return false;
                             }
 
                             break;
@@ -5566,14 +5511,14 @@ namespace Oxide.Plugins
                         {
                             if (!_config.Settings.Markers.Scheduled)
                             {
-                                return _false;
+                                return false;
                             }
 
                             break;
                         }
                 }
 
-                return _true;
+                return true;
             }
 
             private void KillNpc()
@@ -5698,13 +5643,14 @@ namespace Oxide.Plugins
             Unsubscribe(nameof(OnEntityDeath));
             Unsubscribe(nameof(CanPickupEntity));
             Unsubscribe(nameof(OnPlayerDeath));
-            Unsubscribe(nameof(OnPlayerHealthChange));
+            Unsubscribe(nameof(OnPlayerDropActiveItem));
             Unsubscribe(nameof(OnNpcTarget));
             Unsubscribe(nameof(OnEntitySpawned));
-            Unsubscribe(nameof(OnPlayerCorpseSpawned));
             Unsubscribe(nameof(OnCupboardAuthorize));
             Unsubscribe(nameof(OnActiveItemChanged));
             Unsubscribe(nameof(OnLoseCondition));
+            Unsubscribe(nameof(OnFireBallSpread));
+            Unsubscribe(nameof(CanBuild));
         }
 
         private void OnMapMarkerAdded(BasePlayer player, ProtoBuf.MapNote note)
@@ -5731,7 +5677,7 @@ namespace Oxide.Plugins
             lastSpawnRequestTime = Time.realtimeSinceStartup;
             Backbone = new SingletonBackbone(this);
             Unsubscribe(nameof(OnMapMarkerAdded));
-            Unsubscribe(nameof(OnPlayerConnected));
+            Unsubscribe(nameof(OnPlayerSleepEnded));
             UnsubscribeHooks();
         }
 
@@ -5768,7 +5714,7 @@ namespace Oxide.Plugins
             }
 
             SaveData();
-            SetUnloading();
+            RaidableBase.Unload();
             StopScheduleCoroutine();
             StopMaintainCoroutine();
             StopGridCoroutine();
@@ -5874,69 +5820,44 @@ namespace Oxide.Plugins
 
         private void CheckForWipe()
         {
-            if (!wiped && BuildingManager.server.buildingDictionary.Count == 0)
+            if (!wiped && storedData.Players.Count >= _config.RankedLadder.Amount && BuildingManager.server.buildingDictionary.Count == 0)
             {
-                if (storedData.Players.Count >= _config.RankedLadder.Amount)
+                foreach (var pi in storedData.Players.Values)
                 {
-                    foreach (var pi in storedData.Players.Values)
+                    if (pi.Raids > 0)
                     {
-                        if (pi.Raids > 0)
-                        {
-                            wiped = true;
-                            break;
-                        }
+                        wiped = true;
+                        break;
                     }
                 }
             }
-            
+
             if (wiped)
             {
                 var raids = new List<int>();
+                var dict = new Dictionary<string, PlayerInfo>(storedData.Players);
 
                 if (storedData.Players.Count > 0)
                 {
-                    var ladder = new List<KeyValuePair<string, int>>();
-
-                    foreach (var entry in storedData.Players)
+                    if (AssignTreasureHunters())
                     {
-                        int value = entry.Value.Raids;
-
-                        if (value > 0)
+                        foreach (var entry in dict)
                         {
-                            ladder.Add(new KeyValuePair<string, int>(entry.Key, value));
-                        }
-                    }
-
-                    if (AssignTreasureHunters(ladder))
-                    {
-                        var dict = new Dictionary<string, PlayerInfo>(storedData.Players);
-
-                        foreach (var kvp in dict)
-                        {
-                            if (kvp.Value.Raids > 0)
+                            if (entry.Value.Raids > 0)
                             {
-                                raids.Add(kvp.Value.Raids);
+                                raids.Add(entry.Value.Raids);
                             }
 
-                            storedData.Players[kvp.Key].Raids = 0;
-
-                            if (kvp.Value.TotalRaids == 0)
-                            {
-                                storedData.Players.Remove(kvp.Key);
-                            }
+                            storedData.Players[entry.Key].Raids = 0;
                         }
-
-                        dict.Clear();
                     }
-
-                    ladder.Clear();
                 }
 
                 if (raids.Count > 0)
                 {
                     var average = raids.Average();
 
-                    foreach (var entry in new Dictionary<string, PlayerInfo>(storedData.Players))
+                    foreach (var entry in dict)
                     {
                         if (entry.Value.TotalRaids < average)
                         {
@@ -5957,7 +5878,7 @@ namespace Oxide.Plugins
             {
                 if (string.IsNullOrEmpty(monument.displayPhrase.translated))
                 {
-                    float size = monument.name.Contains("power_sub") ? 35f : Mathf.Max(monument.Bounds.size.Max(), 75f); // 75 is for invalid custom map prefabs with no bounds, or when its size is less than 75
+                    float size = monument.name.Contains("power_sub") ? 35f : Mathf.Max(monument.Bounds.size.Max(), 75f);
                     monuments[monument] = monument.name.Contains("cave") ? 75f : monument.name.Contains("OilrigAI") ? 150f : size;
                 }
                 else
@@ -5976,7 +5897,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var zoneIds = ZoneManager.Call("GetZoneIDs") as string[];
+            var zoneIds = ZoneManager?.Call("GetZoneIDs") as string[];
 
             if (zoneIds == null)
             {
@@ -6061,7 +5982,7 @@ namespace Oxide.Plugins
 
             if (_config.UI.Enabled)
             {
-                Subscribe(nameof(OnPlayerConnected));
+                Subscribe(nameof(OnPlayerSleepEnded));
             }
         }
 
@@ -6075,10 +5996,7 @@ namespace Oxide.Plugins
 
         private void OnClanDestroy(string tag)
         {
-            foreach (var raid in Raids.Values)
-            {
-                raid.UpdateClans(tag);
-            }
+            OnClanUpdate(tag);
         }
 
         private void OnFriendAdded(string playerId, string targetId)
@@ -6099,7 +6017,14 @@ namespace Oxide.Plugins
 
         private object CanBuildRevertBlock(BasePlayer player, Vector3 target)
         {
-            return !RaidableBase.Get(target)?.Options.AllowBuildRevertLadders;
+            var raid = RaidableBase.Get(target);
+
+            if (raid == null || raid.Options.AllowBuildRevertLadders)
+            {
+                return null;
+            }
+
+            return false;
         }
 
         private object OnRestoreUponDeath(BasePlayer player)
@@ -6118,7 +6043,12 @@ namespace Oxide.Plugins
         {
             var raid = RaidableBase.Get(targetId);
 
-            return raid != null && raid.Options.NPC.DespawnInventory ? true : (object)null;
+            if (raid == null || !raid.Options.NPC.DespawnInventory)
+            {
+                return null;
+            }
+
+            return true;
         }
 
         private object canTeleport(BasePlayer player)
@@ -6133,23 +6063,15 @@ namespace Oxide.Plugins
 
         private void OnEntityMounted(BaseMountable m, BasePlayer player)
         {
-            if (!m.IsValid() || !player.IsValid())
-            {
-                return;
-            }
-
             var raid = RaidableBase.Get(player.transform.position);
 
-            if (raid == null)
+            if (raid == null || raid.intruders.Contains(player))
             {
                 return;
             }
 
-            if (!raid.intruders.Contains(player))
-            {
-                player.EnsureDismounted();
-                raid.RemovePlayer(player);
-            }
+            player.EnsureDismounted();
+            raid.RemovePlayer(player);
         }
 
         private object OnLoseCondition(Item item, float amount)
@@ -6198,14 +6120,14 @@ namespace Oxide.Plugins
                 else raid.conditions[uid] = item.condition;
             });
 
-            return _true;
+            return true;
         }
 
         private void OnEntityBuilt(Planner planner, GameObject go)
         {
             var e = go.ToBaseEntity();
 
-            if (!IsValid(e))
+            if (e == null)
             {
                 return;
             }
@@ -6217,42 +6139,38 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (e is BuildingPrivlidge && !raid.Options.AllowBuildingPriviledges)
+            if (!raid.Options.AllowBuildingPriviledges && e is BuildingPrivlidge)
             {
                 var player = planner.GetOwnerPlayer();
-                var slot = player.inventory.FindItemID("cupboard.tool");
+                var item = player.inventory.FindItemID("cupboard.tool");
 
-                if (slot != null)
+                if (item != null)
                 {
-                    slot.amount++;
-                    slot.MarkDirty();
+                    item.amount++;
+                    item.MarkDirty();
                 }
                 else player.GiveItem(ItemManager.CreateByName("cupboard.tool"));
 
-                NextTick(() => 
-                {
-                    if (e == null || e.IsDestroyed) return;
-                    e.Kill();
-                });
-
+                e.Invoke(e.KillMessage, 0.1f);
                 return;
             }
 
             var priv = e.GetBuildingPrivilege();
+            bool flag = priv.IsValid();
 
-            if (e is BuildingBlock && priv.IsValid() && IsExploitingBuildingParts(priv, e))
+            if (flag && (e.prefabID == 3234260181 || e.prefabID == 72949757) && IsExploitingBuildingParts(priv, raid))
             {
                 e.Invoke(e.KillMessage, 0.1f);
                 return;
             }
 
-            if (Distance2D(raid.Location, e.transform.position) <= Radius)
+            if (InRange(raid.Location, e.transform.position, Radius))
             {
                 AddEntity(e, raid);
                 return;
             }
-            
-            if (priv.IsValid())
+
+            if (flag)
             {
                 if (priv.net.ID < raid.NetworkID)
                 {
@@ -6270,11 +6188,11 @@ namespace Oxide.Plugins
             AddEntity(e, raid);
         }
 
-        private bool IsExploitingBuildingParts(BuildingPrivlidge priv, BaseEntity e)
+        private bool IsExploitingBuildingParts(BuildingPrivlidge priv, RaidableBase raid)
         {
             if (!EventTerritory(priv.transform.position)) // placing priv outside dome
             {
-                return _true;
+                return true;
             }
 
             var building = priv.GetBuilding();
@@ -6283,19 +6201,26 @@ namespace Oxide.Plugins
             {
                 foreach (var block in building.buildingBlocks)
                 {
+                    if (raid.blocks.Contains(block.net.ID))
+                    {
+                        continue;
+                    }
+
                     if (!EventTerritory(block.transform.position))
                     {
-                        return _true;
+                        return true;
                     }
+                    else raid.blocks.Add(block.net.ID);
                 }
             }
 
-            return _false;
+            return false;
         }
 
         private void AddEntity(BaseEntity e, RaidableBase raid)
         {
             raid.BuiltList.Add(e.net.ID);
+            RaidEntities[e] = raid;
 
             if (_config.Settings.Management.DoNotDestroyDeployables && e.name.Contains("assets/prefabs/deployable/"))
             {
@@ -6310,29 +6235,36 @@ namespace Oxide.Plugins
             }
         }
 
-        private object CanBeTargeted(NPCPlayerApex npc, FlameTurret ft)
+        private object CanBeTargeted(NPCPlayerApex npc, StorageContainer container) // guntrap and flameturret. containerioentity for autoturrets which is already covered by priv
         {
             return RaidableBase.Has(npc) ? false : (object)null;
         }
 
-        private object CanBeTargeted(NPCPlayerApex npc, GunTrap gt)
-        {
-            return RaidableBase.Has(npc) ? false : (object)null;
-        }
-
+#if USE_HTN_HOOK
         private object OnNpcTarget(NPCPlayerApex npc, BaseEntity entity)
         {
-            return RaidableBase.Has(npc) && entity.IsNpc ? true : (object)null;
+            return entity.IsNpc && RaidableBase.Has(npc) ? true : (object)null;
         }
 
         private object OnNpcTarget(BaseEntity entity, NPCPlayerApex npc)
         {
-            return RaidableBase.Has(npc) && entity.IsNpc ? true : (object)null;
+            return entity.IsNpc && RaidableBase.Has(npc) ? true : (object)null;
         }
+#else
+        private object OnNpcTarget(NPCPlayerApex npc, NPCPlayerApex npc2)
+        {
+            return RaidableBase.Has(npc) ? true : (object)null;
+        }
+
+        private object OnNpcTarget(BaseNpc entity, NPCPlayerApex npc)
+        {
+            return RaidableBase.Has(npc) ? true : (object)null;
+        }
+#endif
 
         private void OnActiveItemChanged(BasePlayer player, Item oldItem, Item newItem)
         {
-            if (player.inventory?.containerBelt == null || player.IsNpc || !EventTerritory(player.transform.position))
+            if (player.IsNpc || !EventTerritory(player.transform.position))
             {
                 return;
             }
@@ -6340,33 +6272,42 @@ namespace Oxide.Plugins
             RaidableBase.StopUsingWand(player);
         }
 
-        private void OnPlayerConnected(BasePlayer player)
+        private void OnPlayerSleepEnded(BasePlayer player)
         {
-            if (!player.IsValid() || !player.IsConnected)
-            {
-                return;
-            }
-
-            if (player.IsSleeping() || player.HasPlayerFlag(BasePlayer.PlayerFlags.ReceivingSnapshot))
-            {
-                timer.Once(0.5f, () => OnPlayerConnected(player));
-                return;
-            }
-
             UI.Update(player);
+
+            NextTick(() =>
+            {
+                if (player == null || player.transform == null)
+                {
+                    return;
+                }
+
+                var raid = RaidableBase.Get(player.transform.position);
+
+                if (raid == null || raid.intruders.Contains(player))
+                {
+                    return;
+                }
+
+                raid.OnEnterRaid(player); // 1.5.1 sleeping bag exploit fix
+            });
         }
 
         private void OnPlayerDeath(BasePlayer player)
         {
-            if (!player.IsNpc && EventTerritory(player.transform.position))
+            if (!player.IsNpc)
             {
-                UI.DestroyStatusUI(player);
-            }
-        }
+                if (EventTerritory(player.transform.position))
+                {
+                    UI.DestroyStatusUI(player);
+                    UnityEngine.Object.Destroy(player.GetComponent<PlayerInputEx>());
+                }
 
-        private void OnPlayerDeath(NPCPlayerApex npc)
-        {
-            var raid = RaidableBase.Get(npc.userID);
+                return;
+            }
+
+            var raid = RaidableBase.Get(player.userID);
 
             if (raid == null)
             {
@@ -6377,27 +6318,28 @@ namespace Oxide.Plugins
 
             if (_config.Settings.Management.UseOwners)
             {
-                var attacker = npc.lastAttacker as BasePlayer;
+                var attacker = player.lastAttacker as BasePlayer;
 
                 if (attacker.IsValid() && !attacker.IsNpc)
                 {
-                    raid.TrySetOwner(attacker, npc, null);
+                    raid.TrySetOwner(attacker, player, null);
                 }
             }
 
             if (raid.Options.NPC.DespawnInventory)
             {
-                npc.inventory.Strip();
+                player.inventory.Strip();
             }
         }
 
-        private void OnPlayerHealthChange(BasePlayer player, float oldValue, float newValue)
+        private object OnPlayerDropActiveItem(BasePlayer player, Item item)
         {
-            if (newValue < 6f && EventTerritory(player.transform.position))
+            if (EventTerritory(player.transform.position))
             {
-                player.svActiveItemID = 0;
-                player.SendNetworkUpdate();
+                return true;
             }
+
+            return null;
         }
 
         private void OnEntityDeath(BuildingPrivlidge priv, HitInfo hitInfo)
@@ -6422,10 +6364,6 @@ namespace Oxide.Plugins
             if (raid.IsOpened && raid.EndWhenCupboardIsDestroyed())
             {
                 raid.CancelInvoke(raid.TryToEnd);
-                //var player = p.Object as BasePlayer;
-                //Backbone.Message(p, "OnRaidFinished", p.UserIDString, FormatGridReference(raid.Location));
-                //Backbone.Message(p, "OnRaidFinished", p.UserIDString, FormatGridReference(raid.Location));
-                //Backbone.Message(p, "OnRaidFinished", p.UserIDString, FormatGridReference(raid.Location));
                 raid.AwardRaiders();
                 raid.Undo();
             }
@@ -6473,7 +6411,7 @@ namespace Oxide.Plugins
         {
             if (_config.Settings.Management.Invulnerable && RaidableBase.Has(container))
             {
-                return _true;
+                return true;
             }
 
             EntityHandler(container, null);
@@ -6491,7 +6429,7 @@ namespace Oxide.Plugins
 
             if (hitInfo?.Initiator == null)
             {
-                DropOrRemoveItems(container, raid.IsOpened);
+                DropOrRemoveItems(container);
             }
             else if (IsLootingWeapon(hitInfo))
             {
@@ -6504,7 +6442,7 @@ namespace Oxide.Plugins
             }
 
             raid._containers.Remove(container);
-            //raid.StartTryToEnd();
+            raid.StartTryToEnd();
             UI.Update(raid);
 
             foreach (var x in Raids.Values)
@@ -6523,20 +6461,14 @@ namespace Oxide.Plugins
 
         private void OnCupboardAuthorize(BuildingPrivlidge priv, BasePlayer player)
         {
-            if (priv == null)
-            {
-                return;
-            }
-
             foreach (var raid in Raids.Values)
             {
-                if (raid.privs.Contains(priv) && raid.Options.RequiresCupboardAccess && !raid.IsAuthed)
+                if (raid.priv == priv && raid.Options.RequiresCupboardAccess && !raid.IsAuthed)
                 {
                     raid.IsAuthed = true;
 
                     if (raid.Options.RequiresCupboardAccess && _config.EventMessages.AnnounceRaidUnlock)
                     {
-                        raid.StartTryToEnd();
                         foreach (var p in BasePlayer.activePlayerList)
                         {
                             Backbone.Message(p, "OnRaidFinished", p.UserIDString, FormatGridReference(raid.Location));
@@ -6554,7 +6486,7 @@ namespace Oxide.Plugins
                     return;
                 }
             }
-            //SpawnNpcs();
+
             Unsubscribe(nameof(OnCupboardAuthorize));
         }
 
@@ -6571,19 +6503,27 @@ namespace Oxide.Plugins
 
             if (_config.Settings.Management.BlacklistedPickupItems.Contains(entity.ShortPrefabName))
             {
-                return _false;
+                return false;
             }
 
-            return !raid.Options.AllowPickup && entity.OwnerID == 0 ? _false : (object)null;
+            return !raid.Options.AllowPickup && entity.OwnerID == 0 ? false : (object)null;
         }
 
-        /*private void OnEntitySpawned(FireBall fb)
+        private void OnFireBallSpread(FireBall ball, BaseEntity fire)
         {
-            if (EventTerritory(fb.transform.position))
+            if (EventTerritory(fire.transform.position))
             {
-                fb.Extinguish();
+                NextTick(() =>
+                {
+                    if (fire == null || fire.IsDestroyed)
+                    {
+                        return;
+                    }
+
+                    fire.Kill();
+                });
             }
-        }*/
+        }
 
         private void OnEntitySpawned(DroppedItemContainer backpack)
         {
@@ -6599,12 +6539,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (raid.AllowPVP && _config.Settings.Management.BackpacksPVP)
-            {
-                backpack.playerSteamID = 0;
-            }
-
-            if (!raid.AllowPVP && _config.Settings.Management.BackpacksPVE)
+            if (raid.AllowPVP && _config.Settings.Management.BackpacksPVP || !raid.AllowPVP && _config.Settings.Management.BackpacksPVE)
             {
                 backpack.playerSteamID = 0;
             }
@@ -6612,11 +6547,13 @@ namespace Oxide.Plugins
 
         private void OnEntitySpawned(BaseLock entity)
         {
-            foreach (var x in Raids.Values)
+            var parent = entity.GetParentEntity();
+
+            foreach (var raid in Raids.Values)
             {
-                foreach (var container in x._containers)
+                foreach (var container in raid._containers)
                 {
-                    if (entity.HasParent() && entity.GetParentEntity() == container)
+                    if (parent == container)
                     {
                         entity.Invoke(entity.KillMessage, 0.1f);
                         break;
@@ -6625,35 +6562,30 @@ namespace Oxide.Plugins
             }
         }
 
-        private void OnPlayerCorpseSpawned(BasePlayer player, PlayerCorpse corpse)
+        private void OnEntitySpawned(PlayerCorpse corpse)
         {
-            if (player == null || player.transform == null)
-            {
-                return;
-            }
-
-            var raid = RaidableBase.Get(player.transform.position);
+            var raid = (PvpDelay.ContainsKey(corpse.playerSteamID) ? GetNearestBase(corpse.transform.position) : RaidableBase.Get(corpse.playerSteamID)) ?? RaidableBase.Get(corpse.transform.position);
 
             if (raid == null)
             {
                 return;
             }
 
-            if (!player.IsNpc)
+            if (corpse.playerSteamID.IsSteamId())
             {
-                if (raid.Any(corpse.playerSteamID))
+                var player = RustCore.FindPlayerById(corpse.playerSteamID);
+
+                if (raid.Any(corpse.playerSteamID, false))
                 {
                     raid.AddCorpse(corpse, player);
                     Interface.CallHook("OnRaidablePlayerCorpse", player, corpse);
                 }
-                else raid.EjectCorpse(player, corpse);
-
-                if (_config.Settings.Management.PlayersLootableInPVE && !raid.AllowPVP)
+                else if (raid.Options.EjectCorpses)
                 {
-                    corpse.playerSteamID = 0;
+                    raid.EjectCorpse(player, corpse);
                 }
-                
-                if (_config.Settings.Management.PlayersLootableInPVP && raid.AllowPVP)
+
+                if (_config.Settings.Management.PlayersLootableInPVE && !raid.AllowPVP || _config.Settings.Management.PlayersLootableInPVP && raid.AllowPVP)
                 {
                     corpse.playerSteamID = 0;
                 }
@@ -6661,45 +6593,49 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var npc = player as NPCPlayerApex;
-
-            if (npc.IsValid() && raid.npcs.Contains(npc))
+            if (raid.Options.NPC.DespawnInventory)
             {
-                if (raid.Options.NPC.DespawnInventory)
-                {
-                    corpse.Invoke(corpse.KillMessage, 30f);
-                }
-
-                raid.npcs.Remove(npc);
-
-                if (raid.Options.RespawnRate > 0)
-                {
-                    raid.RespawnNpc();
-                    return;
-                }
-
-                if (!AnyNpcs())
-                {
-                    Unsubscribe(nameof(OnNpcTarget));
-                }
+                corpse.Invoke(corpse.KillMessage, 30f);
             }
+
+            raid.npcs.RemoveAll(npc => npc == null || npc.userID == corpse.playerSteamID);
+            Npcs.Remove(corpse.playerSteamID);
+
+            if (raid.Options.RespawnRate > 0)
+            {
+                raid.RespawnNpc();
+                return;
+            }
+
+            if (!AnyNpcs())
+            {
+                Unsubscribe(nameof(OnNpcTarget));
+            }
+        }
+
+        private object CanBuild(Planner planner, Construction prefab, Construction.Target target)
+        {
+            var buildPos = target.entity && target.entity.transform && target.socket ? target.GetWorldPosition() : target.position;
+
+            if (EventTerritory(buildPos))
+            {
+                target.player.ChatMessage(lang.GetMessage("Building is blocked!", this, target.player.UserIDString));
+                return false;
+            }
+
+            return null;
         }
 
         private void OnLootEntityEnd(BasePlayer player, StorageContainer container)
         {
-            if (IsInvisible(player) || container.inventory == null || container.inventory.itemList == null || container.OwnerID.IsSteamId())
-            {
-                return;
-            }
-
-            if (!(container is BoxStorage) && !(container is BuildingPrivlidge))
+            if (container?.inventory == null || container.OwnerID.IsSteamId() || IsInvisible(player))
             {
                 return;
             }
 
             var raid = RaidableBase.Get(container);
 
-            if (raid == null || raid.Options.DropTimeAfterLooting <= 0)
+            if (raid == null || raid.Options.DropTimeAfterLooting <= 0 || (raid.Options.DropOnlyBoxesAndPrivileges && !(container is BoxStorage) && !(container is BuildingPrivlidge)))
             {
                 return;
             }
@@ -6732,13 +6668,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!raid.AllowPVP && !_config.Settings.Management.BackpacksOpenPVE)
-            {
-                looter.Invoke(looter.EndLooting, 0.1f);
-                Player.Message(looter, lang.GetMessage("NotAllowed", this, looter.UserIDString));
-            }
-
-            if (raid.AllowPVP && !_config.Settings.Management.BackpacksOpenPVP)
+            if (!raid.AllowPVP && !_config.Settings.Management.BackpacksOpenPVE || raid.AllowPVP && !_config.Settings.Management.BackpacksOpenPVP)
             {
                 looter.Invoke(looter.EndLooting, 0.1f);
                 Player.Message(looter, lang.GetMessage("NotAllowed", this, looter.UserIDString));
@@ -6754,14 +6684,14 @@ namespace Oxide.Plugins
                 DelaySettings ds;
                 if (PvpDelay.TryGetValue(player.userID, out ds) && (ds.AllowPVP && _config.Settings.Management.BackpacksPVP || !ds.AllowPVP && _config.Settings.Management.BackpacksPVE))
                 {
-                    return _true;
+                    return true;
                 }
-                
+
                 var nearest = GetNearestBase(player.transform.position);
 
                 if (nearest != null && (nearest.AllowPVP && _config.Settings.Management.BackpacksPVP || !nearest.AllowPVP && _config.Settings.Management.BackpacksPVE))
                 {
-                    return _true;
+                    return true;
                 }
             }
 
@@ -6772,7 +6702,7 @@ namespace Oxide.Plugins
                 return null;
             }
 
-            return (raid.AllowPVP && _config.Settings.Management.BackpacksPVP || !raid.AllowPVP && _config.Settings.Management.BackpacksPVE) ? _true : (object)null;
+            return raid.AllowPVP && _config.Settings.Management.BackpacksPVP || !raid.AllowPVP && _config.Settings.Management.BackpacksPVE ? true : (object)null;
         }
 
         private object CanEntityBeTargeted(BaseMountable m, BaseEntity turret)
@@ -6780,6 +6710,11 @@ namespace Oxide.Plugins
             if (!turret.IsValid() || turret.OwnerID.IsSteamId())
             {
                 return null;
+            }
+
+            if (turret is AutoTurret && EventTerritory(m.transform.position) && EventTerritory(turret.transform.position))
+            {
+                return true;
             }
 
             var players = GetMountedPlayers(m);
@@ -6791,17 +6726,27 @@ namespace Oxide.Plugins
 
             var player = players[0];
 
-            return IsValid(player) && !player.IsNpc && EventTerritory(player.transform.position) && IsTrueDamage(turret) && !IsInvisible(player) ? true : (object)null;
+            return IsValid(player) && EventTerritory(player.transform.position) && IsTrueDamage(turret) && !IsInvisible(player) ? true : (object)null;
         }
 
         private object CanEntityBeTargeted(BasePlayer player, BaseEntity turret)
         {
-            return IsValid(player) && !player.IsNpc && turret.IsValid() && !turret.OwnerID.IsSteamId() && EventTerritory(player.transform.position) && IsTrueDamage(turret) && !IsInvisible(player) ? true : (object)null;
+            if (!IsValid(player) || !turret.IsValid() || turret.OwnerID.IsSteamId() || IsInvisible(player))
+            {
+                return null;
+            }
+
+            if (turret is AutoTurret && RaidableBase.Has(player.userID))
+            {
+                return !EventTerritory(turret.transform.position) ? true : (object)null;
+            }
+
+            return !RaidableBase.Has(player.userID) && EventTerritory(player.transform.position) && IsTrueDamage(turret) ? true : (object)null;
         }
 
         private object CanEntityTrapTrigger(BaseTrap trap, BasePlayer player)
         {
-            return IsValid(player) && !player.IsNpc && trap.IsValid() && EventTerritory(player.transform.position) && !IsInvisible(player) ? true : (object)null;
+            return IsValid(player) && !RaidableBase.Has(player.userID) && trap.IsValid() && EventTerritory(player.transform.position) && !IsInvisible(player) ? true : (object)null;
         }
 
         private object CanEntityTakeDamage(BaseEntity entity, HitInfo hitInfo)
@@ -6811,109 +6756,100 @@ namespace Oxide.Plugins
                 return null;
             }
 
-            var raid = RaidableBase.Get(entity.transform.position);
-
-            if (raid != null)
+            if (entity is BasePlayer && HandlePlayerDamage(entity as BasePlayer, hitInfo) == HandledResult.Blocked)
             {
-                if (entity is RidableHorse)
+                return false;
+            }
+            else if (ShouldHandleEntity(entity) && HandleEntityDamage(entity, hitInfo) == HandledResult.Blocked)
+            {
+                return false;
+            }
+
+            if (entity is NPCPlayerApex && RaidableBase.Has(entity as NPCPlayerApex))
+            {
+                return true;
+            }
+
+            var raid = RaidableBase.Get(entity.transform.position);
+            bool isRaidValid = raid != null;
+
+            if (isRaidValid)
+            {
+                if (entity.IsNpc)
+                {
+                    return true;
+                }
+                else if (entity is RidableHorse || !_config.Settings.Management.MountDamage && (entity is BaseMountable || entity is BasicCar || entity.name.Contains("modularcar")))
                 {
                     hitInfo.damageTypes = new DamageTypeList();
                     return null;
-                }
-
-                if (!_config.Settings.Management.MountDamage) 
-                {
-                    if (entity is BaseMountable || entity is BasicCar || entity.name.Contains("modularcar"))
-                    {
-                        hitInfo.damageTypes = new DamageTypeList();
-                        return null;
-                    }
-                }
-
-                if (entity.IsNpc)
-                {
-                    return _true;
                 }
             }
 
             var attacker = hitInfo.Initiator as BasePlayer;
             bool isAttackerValid = IsValid(attacker);
-
-            if (RaidableBase.IsEntity(entity))
+            
+            if (RaidEntities.ContainsKey(entity))
             {
-                if (raid != null && isAttackerValid)
+                if (isAttackerValid && isRaidValid)
                 {
-                    if (entity is BoxStorage)
+                    if (CanBlockOutsideDamage(raid, attacker, raid.Options.BlockOutsideDamageToBaseDistance))
                     {
-                        ulong ID;
-                        if (raid.ID.IsSteamId() && ulong.TryParse(raid.ID, out ID) && raid.IsAlly(attacker.userID, ID))
-                        {
-                            return _false;
-                        }
+                        return false;
                     }
 
-                    if (raid.Options.BlockOutsideDamageToBaseDistance && Vector3.Distance(attacker.transform.position, raid.Location) > Mathf.Max(raid.Options.ProtectionRadius, Radius))
+                    if (raid.ID.IsSteamId() && entity is BoxStorage && raid.IsAlly(attacker.userID, Convert.ToUInt64(raid.ID)))
                     {
-                        return _false;
+                        return false;
                     }
                 }
 
-                return _true;
+                return true;
             }
 
-            if (raid != null)
+            if (isRaidValid)
             {
-                if (hitInfo.Initiator is FireBall)
+                if (!entity.OwnerID.IsSteamId() && (entity is Door || (isAttackerValid && IsTrueDamage(entity))))
                 {
-                    return entity is BasePlayer;
+                    return true;
                 }
                 else if (IsTrueDamage(hitInfo.Initiator))
                 {
                     return !(entity is BuildingBlock);
                 }
-                else if (!entity.OwnerID.IsSteamId() && (entity is Door || (attacker.IsValid() && IsTrueDamage(entity))))
+                else if (hitInfo.Initiator is FireBall)
                 {
-                    return _true;
+                    return entity is BasePlayer;
                 }
                 else if (entity is PlayerCorpse)
                 {
-                    return _true;
+                    return true;
                 }
             }
 
-            if (!isAttackerValid)
+            if (!isAttackerValid || !(entity is BasePlayer))
             {
                 return null;
             }
 
             var victim = entity as BasePlayer;
 
-            if (!IsValid(victim))
+            if (PvpDelay.ContainsKey(victim.userID) || attacker.userID == victim.userID || _config.TruePVE.ServerWidePVP)
+            {
+                return true;
+            }
+
+            if (!EventTerritory(attacker.transform.position) || !isRaidValid || !raid.AllowPVP)
             {
                 return null;
             }
 
-            if (_config.TruePVE.ServerWidePVP && Raids.Count > 0)
-            {
-                return _true;
-            }
-
-            if (!EventTerritory(attacker.transform.position))
-            {
-                return null;
-            }
-
-            if (PvpDelay.ContainsKey(victim.userID) || attacker.userID == victim.userID)
-            {
-                return _true;
-            }
-
-            return raid != null && raid.AllowPVP ? true : (object)null;
+            return true;
         }
 
         private void OnEntityTakeDamage(BaseEntity entity, HitInfo hitInfo)
         {
-            if (!IsValid(entity) || entity.IsDestroyed || hitInfo == null || hitInfo.damageTypes == null)
+            if (entity == null || hitInfo == null || hitInfo.damageTypes == null)
             {
                 return;
             }
@@ -6928,13 +6864,13 @@ namespace Oxide.Plugins
             }
         }
 
-        private void HandlePlayerDamage(BasePlayer victim, HitInfo hitInfo)
+        private HandledResult HandlePlayerDamage(BasePlayer victim, HitInfo hitInfo)
         {
             var raid = RaidableBase.Get(victim.transform.position);
 
             if (raid == null)
             {
-                return;
+                return HandledResult.None;
             }
 
             var attacker = hitInfo?.Initiator as BasePlayer;
@@ -6946,13 +6882,21 @@ namespace Oxide.Plugins
                     if (raid.HasLockout(attacker))
                     {
                         NullifyDamage(hitInfo);
-                        return;
+                        return HandledResult.Blocked;
                     }
 
                     foreach (var fd in Backbone.Destinations)
                     {
                         if (fd.npc == victim)
                         {
+                            var e = attacker.HasParent() ? attacker.GetParentEntity() : null;
+
+                            if (e is ScrapTransportHelicopter || e is HotAirBalloon)
+                            {
+                                NullifyDamage(hitInfo);
+                                return HandledResult.Blocked;
+                            }
+
                             fd.Attack(attacker);
                             break;
                         }
@@ -6963,66 +6907,62 @@ namespace Oxide.Plugins
                     if (!raid.Options.AllowFriendlyFire && raid.IsOnSameTeam(victim.userID, attacker.userID))
                     {
                         NullifyDamage(hitInfo);
-                        return;
+                        return HandledResult.Blocked;
                     }
 
                     if (PvpDelay.ContainsKey(victim.userID))
                     {
-                        return;
+                        return HandledResult.Allowed;
                     }
 
-                    bool flag = raid.Options.BlockOutsideDamageToPlayersDistance && Vector3.Distance(attacker.transform.position, raid.Location) > Mathf.Max(raid.Options.ProtectionRadius, Radius);
-
-                    if (flag || !raid.AllowPVP || (_config.Settings.Management.BlockMounts && attacker.isMounted))
+                    if (!raid.AllowPVP || (_config.Settings.Management.BlockMounts && attacker.isMounted) || CanBlockOutsideDamage(raid, attacker, raid.Options.BlockOutsideDamageToPlayersDistance))
                     {
-                        if (flag && hitInfo.Initiator is FireBall)
-                        {
-                            var fireball = hitInfo.Initiator as FireBall;
-
-                            fireball.Extinguish();
-                        }
-
                         NullifyDamage(hitInfo);
+                        return HandledResult.Blocked;
                     }
                 }
-                else if (raid.HasNPC(attacker.userID))
+                else if (RaidableBase.Has(attacker.userID))
                 {
-                    if (raid.HasNPC(victim.userID))
+                    if (RaidableBase.Has(victim.userID))
                     {
                         NullifyDamage(hitInfo);
-                        return;
+                        return HandledResult.Blocked;
                     }
 
                     if (raid.Options.NPC.Accuracy < UnityEngine.Random.Range(0f, 100f))
                     {
                         if (victim.GetMounted() is MiniCopter || victim.GetMounted() is ScrapTransportHelicopter)
                         {
-                            return;
+                            return HandledResult.Allowed;
                         }
 
                         NullifyDamage(hitInfo);
+                        return HandledResult.Blocked;
                     }
                 }
             }
-            else if (victim is NPCPlayerApex && raid.npcs.Contains(victim as NPCPlayerApex))
+            else if (RaidableBase.Has(victim.userID))
             {
                 NullifyDamage(hitInfo); // make npc's immune to all damage which isn't from a player
+                return HandledResult.Blocked;
             }
+
+            return HandledResult.None;
         }
 
-        private void HandleEntityDamage(BaseEntity entity, HitInfo hitInfo)
+        private HandledResult HandleEntityDamage(BaseEntity entity, HitInfo hitInfo)
         {
             var raid = RaidableBase.Get(entity);
 
             if (raid == null)
             {
-                return;
+                return HandledResult.None;
             }
 
-            if ((_config.Settings.Management.BlocksImmune && entity is BuildingBlock) || (hitInfo.Initiator == null && hitInfo.damageTypes.Has(DamageType.Decay)))
+            if (_config.Settings.Management.BlocksImmune && entity is BuildingBlock || hitInfo.Initiator == null && hitInfo.damageTypes.Has(DamageType.Decay))
             {
                 NullifyDamage(hitInfo, entity is BuildingBlock ? entity as BaseCombatEntity : null);
-                return;
+                return HandledResult.Blocked;
             }
 
             if (raid.Type != RaidableType.None)
@@ -7037,42 +6977,44 @@ namespace Oxide.Plugins
 
             var attacker = hitInfo?.Initiator as BasePlayer;
 
-            if (IsValid(attacker) && !attacker.IsNpc)
+            if (!IsValid(attacker) || attacker.IsNpc)
             {
-                if (raid.owner.IsValid() && !raid.IsAlly(attacker))
-                {
-                    NullifyDamage(hitInfo);
-                    return;
-                }
-
-                bool flag = raid.Options.BlockOutsideDamageToBaseDistance && Vector3.Distance(attacker.transform.position, raid.Location) > Mathf.Max(raid.Options.ProtectionRadius, Radius);
-
-                if (flag || (_config.Settings.Management.BlockMounts && attacker.isMounted))
-                {
-                    NullifyDamage(hitInfo);
-                    return;
-                }
-
-                raid.TrySetOwner(attacker, entity, hitInfo);
-
-                if (raid.IsOpened && IsLootingWeapon(hitInfo))
-                {
-                    raid.AddLooter(attacker);
-                }
-
-                if (!raid.Options.ExplosionModifier.Equals(100) && hitInfo.damageTypes.Has(DamageType.Explosion))
-                {
-                    float m = Mathf.Clamp(raid.Options.ExplosionModifier, 0f, 999f);
-
-                    hitInfo.damageTypes.Scale(DamageType.Explosion, m.Equals(0f) ? 0f : m / 100f);
-                }
-
-                if (!raid.Engaged && raid.Type != RaidableType.None)
-                {
-                    raid.Engaged = _true;
-                    raid.CheckDespawn();
-                }
+                return HandledResult.None;
             }
+
+            if (raid.owner.IsValid() && !raid.IsAlly(attacker))
+            {
+                NullifyDamage(hitInfo);
+                return HandledResult.Blocked;
+            }
+
+            if ((_config.Settings.Management.BlockMounts && attacker.isMounted) || CanBlockOutsideDamage(raid, attacker, raid.Options.BlockOutsideDamageToBaseDistance))
+            {
+                NullifyDamage(hitInfo);
+                return HandledResult.Blocked;
+            }
+
+            raid.TrySetOwner(attacker, entity, hitInfo);
+
+            if (raid.IsOpened && IsLootingWeapon(hitInfo))
+            {
+                raid.AddLooter(attacker);
+            }
+
+            if (!raid.Options.ExplosionModifier.Equals(100) && hitInfo.damageTypes.Has(DamageType.Explosion))
+            {
+                float m = Mathf.Clamp(raid.Options.ExplosionModifier, 0f, 999f);
+
+                hitInfo.damageTypes.Scale(DamageType.Explosion, m.Equals(0f) ? 0f : m / 100f);
+            }
+
+            if (!raid.Engaged && raid.Type != RaidableType.None)
+            {
+                raid.Engaged = true;
+                raid.CheckDespawn();
+            }
+
+            return HandledResult.Allowed;
         }
 
         #endregion Hooks
@@ -7103,7 +7045,7 @@ namespace Oxide.Plugins
         {
             if (TerrainMeta.WaterMap.GetHeight(vector) - TerrainMeta.HeightMap.GetHeight(vector) > 5f)
             {
-                return _true;
+                return true;
             }
 
             vector.y += TerrainMeta.HighestPoint.y;
@@ -7111,10 +7053,10 @@ namespace Oxide.Plugins
             RaycastHit hit;
             if (Physics.Raycast(vector, Vector3.down, out hit, vector.y + 1f, Layers.Mask.World, QueryTriggerInteraction.Ignore) && hit.collider.name.StartsWith("ice_sheet"))
             {
-                return _true;
+                return true;
             }
 
-            return _false;
+            return false;
         }
 
         protected void LoadSpawns()
@@ -7190,30 +7132,30 @@ namespace Oxide.Plugins
             if (IsMonumentPosition(vector))
             {
                 draw(vector, "M");
-                return _false;
+                return false;
             }
 
             if (OnIceSheetOrInDeepWater(vector))
             {
                 draw(vector, "D");
-                return _false;
+                return false;
             }
 
             if (!IsAreaSafe(ref vector, radius, Layers.Mask.World | Layers.Mask.Water))
             {
-                return _false;
+                return false;
             }
 
             foreach (var zone in managedZones)
             {
-                if (Distance2D(zone.Key, vector) <= zone.Value)
+                if (InRange(zone.Key, vector, zone.Value))
                 {
                     draw(vector, "Z");
-                    return _false;
+                    return false;
                 }
             }
 
-            return _true;
+            return true;
         }
 
         private void StopGridCoroutine()
@@ -7281,7 +7223,7 @@ namespace Oxide.Plugins
 #if DEBUG
             foreach (var player in BasePlayer.activePlayerList)
             {
-                if (!player.IsAdmin || Distance2D(player.transform.position, pos) > 100f)
+                if (!player.IsAdmin || !InRange(player.transform.position, pos, 100f))
                     continue;
 
                 player.SendConsoleCommand("ddraw.text", 60f, Color.yellow, pos, text);
@@ -7309,22 +7251,22 @@ namespace Oxide.Plugins
 
         private bool SpawnsFileValid(string spawnsFile)
         {
-            if (!Interface.Oxide.DataFileSystem.ExistsDatafile($"SpawnsDatabase/{spawnsFile}"))
-            {
-                return _false;
-            }
-
             if (Spawns == null || !Spawns.IsLoaded)
             {
-                return _false;
+                return false;
             }
 
-            return Spawns.Call("GetSpawnsCount", spawnsFile) is int;
+            if (!Interface.Oxide.DataFileSystem.ExistsDatafile($"SpawnsDatabase/{spawnsFile}"))
+            {
+                return false;
+            }
+
+            return Spawns?.Call("GetSpawnsCount", spawnsFile) is int;
         }
 
         private List<RaidableSpawnLocation> GetSpawnsLocations(string spawnsFile)
         {
-            object success = Spawns.Call("LoadSpawnFile", spawnsFile);
+            object success = Spawns?.Call("LoadSpawnFile", spawnsFile);
 
             if (success == null)
             {
@@ -7413,13 +7355,17 @@ namespace Oxide.Plugins
                     }
             }
 
-            int attempts = owner.IsValid() ? 1000 : 2000;
+            bool isOwner = IsValid(owner);
+            float safeRadius = Radius * 2f;
+            int attempts = isOwner ? 1000 : 2000;
+            int layers = Layers.Mask.Player_Server | Layers.Mask.Construction | Layers.Mask.Deployed;
+            float buildRadius = Mathf.Max(_config.Settings.Management.CupboardDetectionRadius, options.ArenaWalls.Radius, options.ProtectionRadius) + 5f;
 
             while (rs.Count > 0 && attempts > 0)
             {
                 var rsl = rs.GetRandom();
 
-                if (distanceFrom > 0 && IsValid(owner) && Distance2D(owner.transform.position, rsl.Location) > distanceFrom)
+                if (isOwner && distanceFrom > 0 && !InRange(owner.transform.position, rsl.Location, distanceFrom))
                 {
                     num1++;
                     continue;
@@ -7432,7 +7378,7 @@ namespace Oxide.Plugins
 
                 attempts--;
 
-                if (!IsAreaSafe(ref rsl.Location, Radius * 2f, Layers.Mask.Player_Server | Layers.Mask.Construction | Layers.Mask.Deployed, type, options.ArenaWalls.Radius))
+                if (!IsAreaSafe(ref rsl.Location, safeRadius, layers, type, options.ArenaWalls.Radius))
                 {
                     continue;
                 }
@@ -7442,7 +7388,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                if (HasActivePlayerBuildingPrivilege(rsl.Location, Mathf.Max(_config.Settings.Management.CupboardDetectionRadius, options.ProtectionRadius) + 5f))
+                if (HasActivePlayerBuildingPrivilege(rsl.Location, buildRadius))
                 {
                     continue;
                 }
@@ -7459,6 +7405,11 @@ namespace Oxide.Plugins
                     }
 
                     position.y = w;
+                }
+
+                if (!raidSpawns.ContainsKey(type) && !options.Submerged && IsSubmerged(position, Mathf.Max(options.ArenaWalls.Radius, options.ProtectionRadius)))
+                {
+                    continue;
                 }
 
                 if (!checkTerrain)
@@ -7479,16 +7430,32 @@ namespace Oxide.Plugins
             return Vector3.zero;
         }
 
+        private bool IsSubmerged(Vector3 position, float radius)
+        {
+            foreach (var vector in GetCircumferencePositions(position, radius, 30f, false, 1f)) // 70 to 30 in 1.5.1
+            {
+                float w = TerrainMeta.WaterMap.GetHeight(vector);
+                float h = TerrainMeta.HeightMap.GetHeight(vector);
+
+                if (w - h > 1f)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         public bool HasActivePlayerBuildingPrivilege(Vector3 target, float radius)
         {
-            bool flag = _false;
+            bool flag = false;
             var list = Pool.GetList<BuildingPrivlidge>();
             Vis.Entities(target, radius, list);
             foreach (var tc in list)
             {
                 if (tc.IsValid() && tc.OwnerID.IsSteamId())
                 {
-                    flag = _true;
+                    flag = true;
                     break;
                 }
             }
@@ -7653,26 +7620,34 @@ namespace Oxide.Plugins
         {
             foreach (var monument in monuments)
             {
-                if (Distance2D(monument.Key.transform.position, target) < monument.Value)
+                if (InRange(monument.Key.transform.position, target, monument.Value))
                 {
-                    return _true;
+                    return true;
                 }
             }
 
-            return _false;
+            return false;
         }
 
-        public bool TryOpenEvent(RaidableType type, Vector3 position, int uid, string BaseName, KeyValuePair<string, BuildingOptions> building, out RaidableBase raid)
+        private void SetAllowPVP(RaidableType type, RaidableBase raid, bool flag)
         {
-            if (IsUnloading)
+            if (type == RaidableType.Maintained && _config.Settings.Maintained.ConvertPVP)
             {
-                raid = null;
-                return _false;
+                raid.AllowPVP = false;
             }
-
-            raid = new GameObject().AddComponent<RaidableBase>();
-
-            if (type == RaidableType.Maintained && _config.Settings.Maintained.ConvertPVE)
+            else if (type == RaidableType.Scheduled && _config.Settings.Schedule.ConvertPVP)
+            {
+                raid.AllowPVP = false;
+            }
+            else if (type == RaidableType.Manual && _config.Settings.Manual.ConvertPVP)
+            {
+                raid.AllowPVP = false;
+            }
+            else if (type == RaidableType.Purchased && _config.Settings.Buyable.ConvertPVP)
+            {
+                raid.AllowPVP = false;
+            }
+            else if (type == RaidableType.Maintained && _config.Settings.Maintained.ConvertPVE)
             {
                 raid.AllowPVP = true;
             }
@@ -7688,9 +7663,22 @@ namespace Oxide.Plugins
             {
                 raid.AllowPVP = true;
             }
-            else raid.AllowPVP = building.Value.AllowPVP;
+            else raid.AllowPVP = flag;
+        }
 
-            raid.DifficultyMode = building.Value.Mode == RaidableMode.Easy ? Backbone.GetMessage("ModeEasy") : building.Value.Mode == RaidableMode.Medium ? Backbone.GetMessage("ModeMedium") : building.Value.Mode == RaidableMode.Hard ? Backbone.GetMessage("ModeHard") : building.Value.Mode == RaidableMode.Expert ? Backbone.GetMessage("ModeExpert") : Backbone.GetMessage("ModeNightmare");
+        public bool TryOpenEvent(RaidableType type, Vector3 position, int uid, string BaseName, KeyValuePair<string, BuildingOptions> building, out RaidableBase raid)
+        {
+            if (IsUnloading)
+            {
+                raid = null;
+                return false;
+            }
+
+            raid = new GameObject().AddComponent<RaidableBase>();
+
+            SetAllowPVP(type, raid, building.Value.AllowPVP);
+
+            raid.DifficultyMode = building.Value.Mode == RaidableMode.Easy ? Backbone.Easy : building.Value.Mode == RaidableMode.Medium ? Backbone.Medium : building.Value.Mode == RaidableMode.Hard ? Backbone.Hard : building.Value.Mode == RaidableMode.Expert ? Backbone.Expert : Backbone.Nightmare;
 
             /*if (Options.ExplosionModifier != 100f)
             {
@@ -7715,14 +7703,18 @@ namespace Oxide.Plugins
                 Subscribe(nameof(OnActiveItemChanged));
             }
 
-            Subscribe(nameof(CanEntityTakeDamage));
             Subscribe(nameof(OnEntitySpawned));
-            Subscribe(nameof(OnEntityTakeDamage));
+
+            if (IsPVE())
+            {
+                Subscribe(nameof(CanEntityTakeDamage)); 
+            }
+            else Subscribe(nameof(OnEntityTakeDamage));
 
             storedData.TotalEvents++;
             SaveData();
 
-            if (_config.LustyMap.Enabled)
+            if (_config.LustyMap.Enabled && LustyMap != null && LustyMap.IsLoaded)
             {
                 AddTemporaryLustyMarker(position, uid);
             }
@@ -7733,8 +7725,7 @@ namespace Oxide.Plugins
             }
 
             Raids[uid] = raid;
-
-            return _true;
+            return true;
         }
 
         #endregion
@@ -7757,11 +7748,11 @@ namespace Oxide.Plugins
                 {
                     if (raid.IsLoading)
                     {
-                        return _false;
+                        return false;
                     }
                 }
 
-                return _true;
+                return true;
             }
         }
 
@@ -7770,22 +7761,23 @@ namespace Oxide.Plugins
             if (_config.Settings.ServerRewards.Any && ServerRewards != null && ServerRewards.IsLoaded)
             {
                 int cost = mode == RaidableMode.Easy ? _config.Settings.ServerRewards.Easy : mode == RaidableMode.Medium ? _config.Settings.ServerRewards.Medium : mode == RaidableMode.Hard ? _config.Settings.ServerRewards.Hard : mode == RaidableMode.Expert ? _config.Settings.ServerRewards.Expert : _config.Settings.ServerRewards.Nightmare;
-                int points = ServerRewards.Call<int>("CheckPoints", buyer.userID);
+                var success = ServerRewards?.Call("CheckPoints", buyer.userID);
+                int points = success is int ? Convert.ToInt32(success) : 0;
 
-                if (points - cost >= 0)
+                if (points > 0 && points - cost >= 0)
                 {
                     if (BuyRaid(player, mode))
                     {
                         ServerRewards.Call("TakePoints", buyer.userID, cost);
                         Backbone.Message(buyer, "ServerRewardPointsTaken", buyer.UserIDString, cost);
                         if (buyer != player) Backbone.Message(player, "ServerRewardPointsGift", player.UserIDString, buyer.displayName, cost);
-                        return _true;
+                        return true;
                     }
                 }
                 else Backbone.Message(buyer, "ServerRewardPointsFailed", buyer.UserIDString, cost);
             }
 
-            return _false;
+            return false;
         }
 
         private bool TryBuyRaidEconomics(BasePlayer buyer, BasePlayer player, RaidableMode mode)
@@ -7793,22 +7785,23 @@ namespace Oxide.Plugins
             if (_config.Settings.Economics.Any && Economics != null && Economics.IsLoaded)
             {
                 var cost = mode == RaidableMode.Easy ? _config.Settings.Economics.Easy : mode == RaidableMode.Medium ? _config.Settings.Economics.Medium : mode == RaidableMode.Hard ? _config.Settings.Economics.Hard : mode == RaidableMode.Expert ? _config.Settings.Economics.Expert : _config.Settings.Economics.Nightmare;
-                var points = Economics.Call<double>("Balance", buyer.UserIDString);
+                var success = Economics?.Call("Balance", buyer.UserIDString);
+                var points = success is double ? Convert.ToDouble(success) : 0;
 
-                if (points - cost >= 0)
+                if (points > 0 && points - cost >= 0)
                 {
                     if (BuyRaid(player, mode))
                     {
                         Economics.Call("Withdraw", buyer.UserIDString, cost);
                         Backbone.Message(buyer, "EconomicsWithdraw", buyer.UserIDString, cost);
                         if (buyer != player) Backbone.Message(player, "EconomicsWithdrawGift", player.UserIDString, buyer.displayName, cost);
-                        return _true;
+                        return true;
                     }
                 }
                 else Backbone.Message(buyer, "EconomicsWithdrawFailed", buyer.UserIDString, cost);
             }
 
-            return _false;
+            return false;
         }
 
         private bool BuyRaid(BasePlayer owner, RaidableMode mode)
@@ -7818,53 +7811,44 @@ namespace Oxide.Plugins
 
             if (position != Vector3.zero)
             {
-                Backbone.Message(owner, "BuyBaseSpawnedAt", owner.UserIDString, position, FormatGridReference(position));
-
-                var announcement = Backbone.GetMessage("BuyBaseAnnouncement", owner.UserIDString, owner.displayName, position, FormatGridReference(position));
+                var grid = FormatGridReference(position);
+                Backbone.Message(owner, "BuyBaseSpawnedAt", owner.UserIDString, position, grid);
 
                 if (_config.EventMessages.AnnounceBuy)
                 {
-                    Broadcast(announcement);
+                    foreach (var target in BasePlayer.activePlayerList)
+                    {
+                        var announcement = Backbone.GetMessage("BuyBaseAnnouncement", target.UserIDString, owner.displayName, position, grid);
+                        target.SendConsoleCommand("chat.add", 2, _config.Settings.ChatID, announcement);
+                    }
                 }
 
-                Puts(Backbone.RemoveFormatting(announcement));
-
-                return _true;
+                Puts(Backbone.RemoveFormatting(Backbone.GetMessage("BuyBaseAnnouncement", null, owner.displayName, position, grid)));
+                return true;
             }
 
             Backbone.Message(owner, message, owner.UserIDString);
-            return _false;
-        }
-
-        private void Broadcast(string format, params object[] args)
-        {
-            if (BasePlayer.activePlayerList.Count >= 1)
-            {
-                ConsoleNetwork.BroadcastToAllClients("chat.add", 2, _config.Settings.ChatID, (args.Length != 0) ? string.Format(format, args) : format);
-            }
+            return false;
         }
 
         private static bool IsDifficultyAvailable(RaidableMode mode, bool checkAllowPVP)
         {
             if (!CanSpawnDifficultyToday(mode))
             {
-                return _false;
+                return false;
             }
 
             foreach (var option in _config.RaidableBases.Buildings.Values)
             {
-                if (option.Mode == mode)
+                if (option.Mode != mode || (checkAllowPVP && !_config.Settings.Buyable.BuyPVP && option.AllowPVP))
                 {
-                    if (checkAllowPVP && !_config.Settings.Buyable.BuyPVP && option.AllowPVP)
-                    {
-                        continue;
-                    }
-
-                    return _true;
+                    continue;
                 }
+
+                return true;
             }
 
-            return _false;
+            return false;
         }
 
         private void PasteBuilding(RaidableType type, Vector3 position, KeyValuePair<string, BuildingOptions> building, BasePlayer owner)
@@ -7890,9 +7874,9 @@ namespace Oxide.Plugins
                 }
             });
 
-            //var options = new string[] { "auth", "false", "autoheight", "false", "entityowner", "false" };
             var list = GetListedOptions(building.Value.PasteOptions);
             float rotationCorrection = IsValid(owner) ? DegreeToRadian(owner.GetNetworkRotation().eulerAngles.y) : 0f;
+
             CopyPaste.Call("TryPasteFromVector3", position, rotationCorrection, building.Key, list.ToArray(), callback);
         }
 
@@ -7949,6 +7933,11 @@ namespace Oxide.Plugins
 
         private void OnPasteFinished(List<BaseEntity> pastedEntities)
         {
+            if (pastedEntities == null || pastedEntities.Count == 0)
+            {
+                return;
+            }
+
             Timer t = null;
 
             t = timer.Repeat(1f, 120, () =>
@@ -7977,14 +7966,12 @@ namespace Oxide.Plugins
 
                 int baseIndex = 0;
 
-                while (Bases.ContainsKey(baseIndex) || Indices.Contains(baseIndex))
+                while (Bases.ContainsKey(baseIndex) || Indices.ContainsKey(baseIndex))
                 {
                     baseIndex = UnityEngine.Random.Range(1, 9999999);
                 }
 
-                Indices.Add(baseIndex);
-                pastedEntities.RemoveAll(e => !IsValid(e) || e.IsDestroyed);
-
+                Indices[baseIndex] = raid;
                 Bases[baseIndex] = pastedEntities;
 
                 raid.SetEntities(baseIndex);
@@ -8006,13 +7993,16 @@ namespace Oxide.Plugins
             }
 
             int total = 0;
-            var list = new List<BaseEntity>(Bases[baseIndex]);
             OreResourceEntity ore;
+            var entities = Bases[baseIndex];
 
-            foreach (var e in list)
+            while (entities.Count > 0)
             {
+                var e = entities[0];
+
                 if (e == null)
                 {
+                    entities.Remove(e);
                     continue;
                 }
 
@@ -8028,22 +8018,18 @@ namespace Oxide.Plugins
                     e.Kill();
                 }
 
-                //yield return new WaitWhile(() => !e.IsDestroyed);
-
-                if (++total % 15 == 0)
+                if (_config.Settings.BatchLimit > 0 && ++total % _config.Settings.BatchLimit == 0)
                 {
                     yield return null;
                 }
+                else yield return new WaitWhile(() => !e.IsDestroyed);
+
+                entities.Remove(e);
+                RaidEntities.Remove(e);
             }
 
-            list.Clear();
-
-            if (Bases.ContainsKey(baseIndex))
-            {
-                Bases[baseIndex].Clear();
-                Bases[baseIndex] = null;
-                Bases.Remove(baseIndex);
-            }
+            Bases.Remove(baseIndex);
+            Indices.Remove(baseIndex);
 
             if (Bases.Count == 0)
             {
@@ -8062,9 +8048,15 @@ namespace Oxide.Plugins
             {
                 if (_config.EventMessages.ShowWarning)
                 {
-                    Broadcast(Backbone.GetMessage("DestroyingBaseAt", "0", FormatGridReference(position), _config.Settings.Management.DespawnMinutes));
-                }
+                    var grid = FormatGridReference(position);
 
+                    foreach (var target in BasePlayer.activePlayerList)
+                    {
+                        var message = Backbone.GetMessage("DestroyingBaseAt", target.UserIDString, grid, _config.Settings.Management.DespawnMinutes);
+                        target.SendConsoleCommand("chat.add", 2, _config.Settings.ChatID, message);
+                    }
+                }
+                
                 float time = _config.Settings.Management.DespawnMinutes * 60f;
 
                 if (raid != null)
@@ -8075,7 +8067,7 @@ namespace Oxide.Plugins
 
                 timer.Once(time, () =>
                 {
-                    if (!IsUnloading && Bases.ContainsKey(baseIndex))
+                    if (!IsUnloading)
                     {
                         ServerMgr.Instance.StartCoroutine(UndoRoutine(baseIndex));
                     }
@@ -8103,7 +8095,7 @@ namespace Oxide.Plugins
                 float z = center.z + radius * (float)Math.Sin(radian);
                 var a = new Vector3(x, 0f, z);
 
-                a.y = y == 0f ? spawnHeight ? GetSpawnHeight(a) : TerrainMeta.HeightMap.GetHeight(a): y;
+                a.y = y == 0f ? spawnHeight ? GetSpawnHeight(a) : TerrainMeta.HeightMap.GetHeight(a) : y;
 
                 if (a.y < -48f)
                 {
@@ -8122,7 +8114,7 @@ namespace Oxide.Plugins
             float maxY = -1000;
             float minY = 1000;
 
-            foreach (var position in GetCircumferencePositions(center, 20f, 70f, true))
+            foreach (var position in GetCircumferencePositions(center, 20f, 30f, true)) // 70 to 30 in 1.5.1
             {
                 if (position.y > maxY) maxY = position.y;
                 if (position.y < minY) minY = position.y;
@@ -8294,6 +8286,7 @@ namespace Oxide.Plugins
         private KeyValuePair<string, BuildingOptions> GetBuilding(RaidableType type, RaidableMode mode, string baseName)
         {
             var list = new List<KeyValuePair<string, BuildingOptions>>();
+            bool isBaseNull = string.IsNullOrEmpty(baseName);
 
             foreach (var building in _config.RaidableBases.Buildings)
             {
@@ -8304,7 +8297,7 @@ namespace Oxide.Plugins
 
                 if (FileExists(building.Key) && Cycle.CanSpawn(type, mode, building.Key))
                 {
-                    if (string.IsNullOrEmpty(baseName))
+                    if (isBaseNull)
                     {
                         list.Add(building);
                     }
@@ -8324,7 +8317,7 @@ namespace Oxide.Plugins
                     var kvp = new KeyValuePair<string, BuildingOptions>(extra.Key, BuildingOptions.Clone(building.Value));
                     kvp.Value.PasteOptions = new List<PasteOption>(extra.Value);
 
-                    if (string.IsNullOrEmpty(baseName))
+                    if (isBaseNull)
                     {
                         list.Add(kvp);
                     }
@@ -8352,13 +8345,13 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrEmpty(building.Key) || building.Value == null)
             {
-                return _false;
+                return false;
             }
 
-            return _true;
+            return true;
         }
 
-        public RaidableMode GetRandomDifficulty()
+        public RaidableMode GetRandomDifficulty(RaidableType type)
         {
             var list = new List<RaidableMode>();
             decimal max = 0;
@@ -8373,61 +8366,18 @@ namespace Oxide.Plugins
                 max += _config.Settings.Schedule.Max;
             }
 
-            if (CanSpawnDifficultyToday(RaidableMode.Easy) && !Exceeds(RaidableMode.Easy, RaidableBase.Get(RaidableMode.Easy), max))
+            foreach (RaidableMode mode in Enum.GetValues(typeof(RaidableMode)))
             {
-                foreach (var o in _config.RaidableBases.Buildings.Values)
+                if (!CanSpawnDifficultyToday(mode) || Exceeds(mode, RaidableBase.Get(mode), max))
                 {
-                    if (o.Mode == RaidableMode.Easy)
-                    {
-                        list.Add(RaidableMode.Easy);
-                        break;
-                    }
+                    continue;
                 }
-            }
 
-            if (CanSpawnDifficultyToday(RaidableMode.Medium) && !Exceeds(RaidableMode.Medium, RaidableBase.Get(RaidableMode.Medium), max))
-            {
-                foreach (var o in _config.RaidableBases.Buildings.Values)
+                foreach (var options in _config.RaidableBases.Buildings.Values)
                 {
-                    if (o.Mode == RaidableMode.Medium)
+                    if (options.Mode == mode && !MustExclude(type, options.AllowPVP))
                     {
-                        list.Add(RaidableMode.Medium);
-                        break;
-                    }
-                }
-            }
-
-            if (CanSpawnDifficultyToday(RaidableMode.Hard) && !Exceeds(RaidableMode.Hard, RaidableBase.Get(RaidableMode.Hard), max))
-            {
-                foreach (var o in _config.RaidableBases.Buildings.Values)
-                {
-                    if (o.Mode == RaidableMode.Hard)
-                    {
-                        list.Add(RaidableMode.Hard);
-                        break;
-                    }
-                }
-            }
-
-            if (CanSpawnDifficultyToday(RaidableMode.Expert) && !Exceeds(RaidableMode.Expert, RaidableBase.Get(RaidableMode.Expert), max))
-            {
-                foreach (var o in _config.RaidableBases.Buildings.Values)
-                {
-                    if (o.Mode == RaidableMode.Expert)
-                    {
-                        list.Add(RaidableMode.Expert);
-                        break;
-                    }
-                }
-            }
-
-            if (CanSpawnDifficultyToday(RaidableMode.Nightmare) && !Exceeds(RaidableMode.Nightmare, RaidableBase.Get(RaidableMode.Nightmare), max))
-            {
-                foreach (var o in _config.RaidableBases.Buildings.Values)
-                {
-                    if (o.Mode == RaidableMode.Nightmare)
-                    {
-                        list.Add(RaidableMode.Nightmare);
+                        list.Add(mode);
                         break;
                     }
                 }
@@ -8474,14 +8424,14 @@ namespace Oxide.Plugins
                     }
             }
 
-            if (percent <= -1)
+            if (percent < 0)
             {
-                return _true;
+                return true;
             }
 
             if (percent == 0m || amount <= 0m || max <= 0m)
             {
-                return _false;
+                return false;
             }
 
             return (amount / max) * 100m >= percent;
@@ -8496,7 +8446,7 @@ namespace Oxide.Plugins
         {
             if (requestedMode != RaidableMode.Random && buildingMode != requestedMode)
             {
-                return _false;
+                return false;
             }
 
             switch (type)
@@ -8505,7 +8455,7 @@ namespace Oxide.Plugins
                     {
                         if (!CanSpawnDifficultyToday(buildingMode) || !_config.Settings.Buyable.BuyPVP && allowPVP)
                         {
-                            return _false;
+                            return false;
                         }
                         break;
                     }
@@ -8514,13 +8464,13 @@ namespace Oxide.Plugins
                     {
                         if (!CanSpawnDifficultyToday(buildingMode))
                         {
-                            return _false;
+                            return false;
                         }
                         break;
                     }
             }
 
-            return _true;
+            return true;
         }
 
         public static bool CanSpawnDifficultyToday(RaidableMode mode)
@@ -8529,38 +8479,38 @@ namespace Oxide.Plugins
             {
                 case DayOfWeek.Monday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Monday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Monday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Monday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Monday : _config.Settings.Management.Nightmare.Monday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Monday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Monday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Monday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Monday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Monday : false;
                     }
                 case DayOfWeek.Tuesday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Tuesday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Tuesday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Tuesday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Tuesday : _config.Settings.Management.Nightmare.Tuesday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Tuesday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Tuesday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Tuesday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Tuesday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Tuesday : false;
                     }
                 case DayOfWeek.Wednesday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Wednesday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Wednesday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Wednesday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Wednesday : _config.Settings.Management.Nightmare.Wednesday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Wednesday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Wednesday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Wednesday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Wednesday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Wednesday : false;
                     }
                 case DayOfWeek.Thursday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Thursday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Thursday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Thursday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Thursday : _config.Settings.Management.Nightmare.Thursday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Thursday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Thursday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Thursday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Thursday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Thursday : false;
                     }
                 case DayOfWeek.Friday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Friday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Friday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Friday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Friday : _config.Settings.Management.Nightmare.Friday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Friday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Friday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Friday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Friday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Friday : false;
                     }
                 case DayOfWeek.Saturday:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Saturday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Saturday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Saturday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Saturday : _config.Settings.Management.Nightmare.Saturday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Saturday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Saturday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Saturday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Saturday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Saturday : false;
                     }
                 default:
                     {
-                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Sunday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Sunday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Sunday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Sunday : _config.Settings.Management.Nightmare.Sunday;
+                        return mode == RaidableMode.Easy ? _config.Settings.Management.Easy.Sunday : mode == RaidableMode.Medium ? _config.Settings.Management.Medium.Sunday : mode == RaidableMode.Hard ? _config.Settings.Management.Hard.Sunday : mode == RaidableMode.Expert ? _config.Settings.Management.Expert.Sunday : mode == RaidableMode.Nightmare ? _config.Settings.Management.Nightmare.Sunday : false;
                     }
             }
         }
+    
+#endregion
 
-        #endregion
-
-        #region Commands
+#region Commands
 
         private void CommandReloadConfig(IPlayer p, string command, string[] args)
         {
@@ -8591,10 +8541,14 @@ namespace Oxide.Plugins
             }
         }
 
-        private List<string> tryBuyCooldowns { get; set; } = new List<string>();
-
         private void CommandBuyRaid(IPlayer p, string command, string[] args)
         {
+            if (args.Length == 0)
+            {
+                p.Reply(Backbone.GetMessage("BuySyntax", p.Id, _config.Settings.BuyCommand, p.IsServer ? "ID" : p.Id));
+                return;
+            }
+
             if (CopyPaste == null || !CopyPaste.IsLoaded)
             {
                 p.Reply(Backbone.GetMessage("LoadCopyPaste", p.Id));
@@ -8610,12 +8564,6 @@ namespace Oxide.Plugins
             if (RaidableBase.Get(RaidableType.Purchased) >= _config.Settings.Buyable.Max)
             {
                 p.Reply(Backbone.GetMessage("Max Manual Events", p.Id, _config.Settings.Buyable.Max));
-                return;
-            }
-
-            if (args.Length == 0)
-            {
-                p.Reply(Backbone.GetMessage("BuySyntax", p.Id, _config.Settings.BuyCommand, p.IsServer ? "ID" : p.Id));
                 return;
             }
 
@@ -8646,7 +8594,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            BasePlayer player = null;
+            var player = p.Object as BasePlayer;
 
             if (args.Length > 1 && args[1].IsSteamId())
             {
@@ -8656,7 +8604,6 @@ namespace Oxide.Plugins
                     player = BasePlayer.FindByID(playerId);
                 }
             }
-            else player = p.Object as BasePlayer;
 
             if (!IsValid(player))
             {
@@ -8666,19 +8613,28 @@ namespace Oxide.Plugins
 
             var buyer = p.Object as BasePlayer ?? player;
             string id = buyer.UserIDString;
-            bool flag = false;
-
-            foreach (var raid in Raids.Values)
+            
+            if (tryBuyCooldowns.Contains(id))
             {
-                if (raid.owner == player)
-                {
-                    flag = true;
-                }
+                p.Reply(Backbone.GetMessage("BuyableAlreadyRequested", p.Id));
+                return;
             }
 
-            if (flag || tryBuyCooldowns.Contains(id) || ServerMgr.Instance.Restarting || SaveRestore.IsSaving)
+            if (ServerMgr.Instance.Restarting)
             {
-                p.Reply(Backbone.GetMessage("BuyableOnCooldown", id));
+                p.Reply(Backbone.GetMessage("BuyableServerRestarting", p.Id));
+                return;
+            }
+
+            if (SaveRestore.IsSaving)
+            {
+                p.Reply(Backbone.GetMessage("BuyableServerSaving", p.Id));
+                return;
+            }
+
+            if (RaidableBase.Any(player))
+            {
+                p.Reply(Backbone.GetMessage("BuyableAlreadyOwner", p.Id));
                 return;
             }
 
@@ -8692,9 +8648,9 @@ namespace Oxide.Plugins
                 return;
             }
 
-            bool flag2 = TryBuyRaidServerRewards(buyer, player, mode) || TryBuyRaidEconomics(buyer, player, mode);
+            bool flag = TryBuyRaidServerRewards(buyer, player, mode) || TryBuyRaidEconomics(buyer, player, mode);
 
-            if (flag2 && _config.Settings.Buyable.Cooldown > 0)
+            if (flag && _config.Settings.Buyable.Cooldown > 0)
             {
                 buyCooldowns.Add(id, Time.realtimeSinceStartup + _config.Settings.Buyable.Cooldown);
                 timer.Once(_config.Settings.Buyable.Cooldown, () => buyCooldowns.Remove(id));
@@ -8704,61 +8660,70 @@ namespace Oxide.Plugins
         private void CommandRaidHunter(IPlayer p, string command, string[] args)
         {
             var player = p.Object as BasePlayer;
-            bool isAdmin = p.IsServer || (player?.IsAdmin ?? p.IsAdmin);
+            bool isAdmin = p.IsServer || player.IsAdmin;
+            string arg = args.Length >= 1 ? args[0].ToLower() : string.Empty;
 
-            if (args.Length >= 1)
+            switch (arg)
             {
-                switch (args[0].ToLower())
-                {
-                    case "resettotal":
+                case "resettotal":
+                    {
+                        if (isAdmin)
                         {
-                            if (!isAdmin) return;
-                            foreach (var entry in storedData.Players.ToList())
+                            foreach (var entry in storedData.Players)
                             {
                                 entry.Value.TotalRaids = 0;
                             }
+
                             SaveData();
-                            return;
                         }
-                    case "resettime":
+
+                        return;
+                    }
+                case "resettime":
+                    {
+                        if (isAdmin)
                         {
-                            if (!isAdmin) return;
                             storedData.RaidTime = DateTime.MinValue.ToString();
                             SaveData();
-                            return;
                         }
-                    case "wipe":
+
+                        return;
+                    }
+                case "wipe":
+                    {
+                        if (isAdmin)
                         {
-                            if (isAdmin)
-                            {
-                                wiped = _true;
-                                CheckForWipe();
-                            }
-                            return;
+                            wiped = true;
+                            CheckForWipe();
                         }
-                    case "grid":
+
+                        return;
+                    }
+                case "grid":
+                    {
+                        if (player.IsValid() && (isAdmin || permission.UserHasPermission(player.UserIDString, drawPermission)))
                         {
-                            if (player.IsValid() && (permission.UserHasPermission(player.UserIDString, drawPermission) || player.IsAdmin)) ShowGrid(player);
-                            return;
+                            ShowGrid(player);
                         }
-                    case "ui":
-                        {
-                            CommandUI(p, command, args.Skip(1).ToArray());
-                            return;
-                        }
-                }
+
+                        return;
+                    }
+                case "ui":
+                    {
+                        CommandUI(p, command, args.Skip(1).ToArray());
+                        return;
+                    }
+                case "ladder":
+                case "lifetime":
+                    {   
+                        ShowLadder(p, args);
+                        return;
+                    }
             }
 
             if (_config.UI.Enabled)
             {
-                if (_config.UI.Lockout.Enabled) p.Reply(Backbone.GetMessage("UIHelpTextAll", p.Id, command));
-                else p.Reply(Backbone.GetMessage("UIHelpText", p.Id, command));
-            }
-
-            if (args.Length >= 1 && (args[0].ToLower() == "ladder" || args[0].ToLower() == "lifetime") && _config.RankedLadder.Enabled)
-            {
-                ShowLadder(p, args);
-                return;
+                p.Reply(Backbone.GetMessage(_config.UI.Lockout.Enabled ? "UIHelpTextAll" : "UIHelpText", p.Id, command));
             }
 
             if (_config.RankedLadder.Enabled)
@@ -8772,21 +8737,23 @@ namespace Oxide.Plugins
                 return;
             }
 
-            DrawRaidLocations(player);
+            if (!player.IsValid())
+            {
+                return;
+            }
+
+            DrawRaidLocations(player, isAdmin || permission.UserHasPermission(player.UserIDString, drawPermission));
         }
 
-        protected void DrawRaidLocations(BasePlayer player)
+        protected void DrawRaidLocations(BasePlayer player, bool hasPerm)
         {
-            if (!player.IsValid() || (!permission.UserHasPermission(player.UserIDString, drawPermission) && !player.IsAdmin) || Raids.Count == 0)
+            if (!hasPerm)
             {
-                if (player.IsValid() && Raids.Count > 0)
+                foreach (var raid in Raids.Values)
                 {
-                    foreach (var raid in Raids.Values)
+                    if (InRange(raid.Location, player.transform.position, 100f))
                     {
-                        if (Distance2D(raid.Location, player.transform.position) < 100f)
-                        {
-                            Player.Message(player, string.Format("{0} @ {1} ({2}", raid.BaseName, raid.Location, PositionToGrid(raid.Location)));
-                        }
+                        Player.Message(player, string.Format("{0} @ {1} ({2}", raid.BaseName, raid.Location, PositionToGrid(raid.Location)));
                     }
                 }
 
@@ -8794,8 +8761,6 @@ namespace Oxide.Plugins
             }
 
             bool isAdmin = player.IsAdmin;
-            double distance;
-            BasePlayer target;
 
             try
             {
@@ -8817,16 +8782,19 @@ namespace Oxide.Plugins
                         }
                     }
 
-                    distance = Math.Round(Vector3.Distance(player.transform.position, raid.Location), 2);
+                    int distance = Mathf.CeilToInt(Vector3.Distance(player.transform.position, raid.Location));
                     string message = string.Format(lang.GetMessage("RaidMessage", this, player.UserIDString), distance, num);
-                    string flag = Backbone.GetMessage(raid.AllowPVP ? "PVPFlag" : "PVEFlag");
-                    
+                    string flag = Backbone.GetMessage(raid.AllowPVP ? "PVPFlag" : "PVEFlag", player.UserIDString);
+
                     player.SendConsoleCommand("ddraw.text", 15f, Color.yellow, raid.Location, string.Format("{0} : {1}{2} {3}", raid.BaseName, flag, raid.Mode(), message));
 
-                    foreach (ulong id in raid.friends)
+                    foreach (var target in raid.friends)
                     {
-                        target = BasePlayer.FindByID(id);
-                        if (!target.IsValid()) continue;
+                        if (!target.IsValid())
+                        {
+                            continue;
+                        }
+
                         player.SendConsoleCommand("ddraw.text", 15f, Color.yellow, target.transform.position, "Ally");
                     }
 
@@ -8835,6 +8803,11 @@ namespace Oxide.Plugins
                         player.SendConsoleCommand("ddraw.text", 15f, Color.yellow, raid.owner.transform.position, "Owner");
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                Puts(ex.StackTrace);
+                Puts(ex.Message);
             }
             finally
             {
@@ -8848,23 +8821,25 @@ namespace Oxide.Plugins
 
         protected void ShowNextScheduledEvent(IPlayer p)
         {
+            string message;
             double time = GetRaidTime();
-            string message = FormatTime(time);
 
-            if (time <= 0)
+            if (BasePlayer.activePlayerList.Count < _config.Settings.Schedule.PlayerLimit)
             {
-                if (BasePlayer.activePlayerList.Count < _config.Settings.Schedule.PlayerLimit)
-                {
-                    message = Backbone.GetMessage("Not Enough Online", p.Id, _config.Settings.Schedule.PlayerLimit);
-                }
-                else message = "0s";
+                message = Backbone.GetMessage("Not Enough Online", p.Id, _config.Settings.Schedule.PlayerLimit);
             }
+            else message = FormatTime(time);
 
             p.Reply(Backbone.GetMessage("Next", p.Id, message));
         }
 
         protected void ShowLadder(IPlayer p, string[] args)
         {
+            if (!_config.RankedLadder.Enabled)
+            {
+                return;
+            }
+
             if (storedData.Players.Count == 0)
             {
                 p.Reply(Backbone.GetMessage("Ladder Insufficient Players", p.Id));
@@ -8874,14 +8849,16 @@ namespace Oxide.Plugins
             if (args.Length == 2 && args[1].ToLower() == "resetme" && storedData.Players.ContainsKey(p.Id))
             {
                 storedData.Players[p.Id].Raids = 0;
+                return;
             }
 
+            string key = args[0].ToLower();
+            var ladder = GetLadder(key);
             int rank = 0;
-            var ladder = GetLadder(args[0]);
 
             ladder.Sort((x, y) => y.Value.CompareTo(x.Value));
 
-            p.Reply(Backbone.GetMessage(args[0].ToLower() == "ladder" ? "Ladder" : "Ladder Total", p.Id));
+            p.Reply(Backbone.GetMessage(key == "ladder" ? "Ladder" : "Ladder Total", p.Id));
 
             foreach (var kvp in ladder)
             {
@@ -8910,7 +8887,7 @@ namespace Oxide.Plugins
 
                 foreach (var rsl in raidSpawns[RaidableType.Grid].All)
                 {
-                    if (Distance2D(rsl.Location, player.transform.position) <= 1000)
+                    if (InRange(rsl.Location, player.transform.position, 1000f))
                     {
                         player.SendConsoleCommand("ddraw.text", 30f, Color.green, rsl.Location, "X");
                     }
@@ -8929,6 +8906,11 @@ namespace Oxide.Plugins
                     player.SendConsoleCommand("ddraw.text", 30f, Color.cyan, monument.Key.transform.position, text);
                 }
             }
+            catch (Exception ex)
+            {
+                Puts(ex.StackTrace);
+                Puts(ex.Message);
+            }
             finally
             {
                 if (!isAdmin)
@@ -8942,10 +8924,11 @@ namespace Oxide.Plugins
         protected List<KeyValuePair<string, int>> GetLadder(string arg)
         {
             var ladder = new List<KeyValuePair<string, int>>();
+            bool isLadder = arg.ToLower() == "ladder";
 
             foreach (var entry in storedData.Players)
             {
-                int value = arg.ToLower() == "ladder" ? entry.Value.Raids : entry.Value.TotalRaids;
+                int value = isLadder ? entry.Value.Raids : entry.Value.TotalRaids;
 
                 if (value > 0)
                 {
@@ -8956,7 +8939,7 @@ namespace Oxide.Plugins
             return ladder;
         }
 
-        protected void NotifyPlayer(IPlayer p, int rank, KeyValuePair<string, int> kvp)
+        private void NotifyPlayer(IPlayer p, int rank, KeyValuePair<string, int> kvp)
         {
             string name = covalence.Players.FindPlayerById(kvp.Key)?.Name ?? kvp.Key;
             string value = kvp.Value.ToString("N0");
@@ -8982,7 +8965,7 @@ namespace Oxide.Plugins
         private void CommandRaidBase(IPlayer p, string command, string[] args)
         {
             var player = p.Object as BasePlayer;
-            bool isAllowed = p.IsServer || (player?.IsAdmin ?? p.IsAdmin) || p.HasPermission(adminPermission);
+            bool isAllowed = p.IsServer || player.IsAdmin || p.HasPermission(adminPermission);
 
             if (!CanCommandContinue(player, p, args, isAllowed))
             {
@@ -9001,7 +8984,7 @@ namespace Oxide.Plugins
 
         protected void ProcessEventCommand(BasePlayer player, IPlayer p, string[] args, bool isAllowed)
         {
-            if (!player.IsValid() || !isAllowed)
+            if (!isAllowed || !player.IsValid())
             {
                 return;
             }
@@ -9035,7 +9018,7 @@ namespace Oxide.Plugins
                     var position = hit.point;
                     var safe = IsAreaSafe(ref position, Radius * 2f, Layers.Mask.Player_Server | Layers.Mask.Construction | Layers.Mask.Deployed, RaidableType.Manual, building.Value.ArenaWalls.Radius);
 
-                    if (!safe && Distance2D(player.transform.position, position) <= Radius * 2f)
+                    if (!safe && !player.IsFlying && InRange(player.transform.position, position, 50f, false))
                     {
                         p.Reply(Backbone.GetMessage("PasteIsBlockedStandAway", p.Id));
                         return;
@@ -9044,7 +9027,7 @@ namespace Oxide.Plugins
                     if (safe && (isAllowed || !IsMonumentPosition(hit.point)))
                     {
                         PasteBuilding(RaidableType.Manual, hit.point, building, null);
-                        if (isAllowed) player.SendConsoleCommand("ddraw.text", 10f, Color.red, hit.point, "XXX");
+                        if (player.IsAdmin) player.SendConsoleCommand("ddraw.text", 10f, Color.red, hit.point, "XXX");
                     }
                     else p.Reply(Backbone.GetMessage("PasteIsBlocked", p.Id));
                 }
@@ -9107,52 +9090,55 @@ namespace Oxide.Plugins
         {
             if (HandledCommandArguments(player, p, isAllowed, args))
             {
-                return _false;
+                return false;
             }
 
             if (CopyPaste == null || !CopyPaste.IsLoaded)
             {
                 p.Reply(Backbone.GetMessage("LoadCopyPaste", p.Id));
-                return _false;
+                return false;
             }
 
-            if (!isAllowed && BaseNetworkable.serverEntities.Count > 300000)
-            {
-                p.Reply(lang.GetMessage("EntityCountMax", this, p.Id));
-                return _false;
-            }
-
-            if (RaidableBase.Get(RaidableType.Manual) >= _config.Settings.Manual.Max && !isAllowed)
+            if (!isAllowed && RaidableBase.Get(RaidableType.Manual) >= _config.Settings.Manual.Max)
             {
                 p.Reply(Backbone.GetMessage("Max Manual Events", p.Id, _config.Settings.Manual.Max));
-                return _false;
+                return false;
             }
 
             if (!IsPasteAvailable)
             {
                 p.Reply(Backbone.GetMessage("PasteOnCooldown", p.Id));
-                return _false;
+                return false;
             }
 
             if (IsSpawnOnCooldown())
             {
                 p.Reply(Backbone.GetMessage("SpawnOnCooldown", p.Id));
-                return _false;
+                return false;
             }
 
-            return _true;
+            if (!isAllowed && BaseNetworkable.serverEntities.Count > 300000)
+            {
+                p.Reply(lang.GetMessage("EntityCountMax", this, p.Id));
+                return false;
+            }
+
+            return true;
         }
 
         private bool HandledCommandArguments(BasePlayer player, IPlayer p, bool isAllowed, string[] args)
         {
             if (args.Length == 0)
             {
-                return _false;
+                return false;
             }
 
             if (player.IsValid())
             {
-                if (!permission.UserHasPermission(player.UserIDString, drawPermission) && !isAllowed) return _false;
+                if (!permission.UserHasPermission(player.UserIDString, drawPermission) && !isAllowed)
+                {
+                    return false;
+                }
 
                 if (args[0].ToLower() == "draw")
                 {
@@ -9180,13 +9166,13 @@ namespace Oxide.Plugins
                         }
                     }
 
-                    return _true;
+                    return true;
                 }
             }
 
             if (!isAllowed)
             {
-                return _false;
+                return false;
             }
 
             switch (args[0].ToLower())
@@ -9201,15 +9187,18 @@ namespace Oxide.Plugins
 
                             foreach (var raid in Raids.Values)
                             {
-                                if (raid.Type != type) continue;
+                                if (raid.Type != type)
+                                {
+                                    continue;
+                                }
+
                                 list.Add(PositionToGrid(raid.Location));
                             }
 
                             p.Reply("{0} : {1} @ {2}", type.ToString(), RaidableBase.Get(type), string.Join(", ", list.ToArray()));
-                            list.Clear();
                         }
 
-                        return _true;
+                        return true;
                     }
                 case "resetmarkers":
                     {
@@ -9221,16 +9210,16 @@ namespace Oxide.Plugins
                             raid.UpdateMarker();
                         }
 
-                        return _true;
+                        return true;
                     }
                 case "despawn":
-                    {
+                    {   
                         if (IsValid(player))
                         {
                             bool success = DespawnBase(player.transform.position);
                             Backbone.Message(player, success ? "DespawnBaseSuccess" : "DespawnBaseNoneAvailable", player.UserIDString);
                             if (success) Puts(Backbone.GetMessage("DespawnedAt", null, player.displayName, FormatGridReference(player.transform.position)));
-                            return _true;
+                            return true;
                         }
 
                         break;
@@ -9243,7 +9232,7 @@ namespace Oxide.Plugins
                             Puts(Backbone.GetMessage("DespawnedAll", null, player?.displayName ?? p.Id));
                         }
 
-                        return _true;
+                        return true;
                     }
                 case "expire":
                 case "resetcooldown":
@@ -9256,17 +9245,17 @@ namespace Oxide.Plugins
                             {
                                 storedData.Lockouts.Remove(target.UserIDString);
                                 SaveData();
-                                p.Reply(string.Format("Removed lockout for {0} ({1})", target.displayName, target.UserIDString));
+                                p.Reply(Backbone.GetMessage("RemovedLockFor", p.Id, target.displayName, target.UserIDString));
                             }
                         }
 
-                        return _true;
+                        return true;
                     }
                 case "expireall":
                     {
                         storedData.Lockouts.Clear();
                         SaveData();
-                        return _true;
+                        return true;
                     }
                 case "setowner":
                 case "lockraid":
@@ -9281,78 +9270,115 @@ namespace Oxide.Plugins
 
                                 if (raid == null)
                                 {
-                                    p.Reply("Your target is not close enough to a raid.");
+                                    p.Reply(Backbone.GetMessage("TargetTooFar", p.Id));
                                 }
                                 else
                                 {
                                     raid.TrySetPayLock(target);
-                                    p.Reply($"Raid has been locked to: {target.displayName}");
+                                    p.Reply(Backbone.GetMessage("RaidLockedTo", p.Id, target.displayName));
                                 }
                             }
-                            else p.Reply("Target not found.");
+                            else p.Reply(Backbone.GetMessage("TargetNotFoundId", p.Id, args[1]));
                         }
 
-                        return _true;
+                        return true;
                     }
                 case "clearowner":
                     {
-                        if (!player.IsValid()) return _true;
+                        if (!player.IsValid()) return true;
 
                         var raid = GetNearestBase(player.transform.position);
 
                         if (raid == null)
                         {
-                            p.Reply("You are not close enough to a raid.");
+                            p.Reply(Backbone.GetMessage("TooFar", p.Id));
                         }
                         else
                         {
                             raid.TrySetPayLock(null);
-                            p.Reply("Raid owner has been cleared.");
+                            p.Reply(Backbone.GetMessage("RaidOwnerCleared", p.Id));
                         }
 
-                        return _true;
+                        return true;
                     }
             }
 
-            return _false;
+            return false;
         }
 
         private void CommandPopulate(IPlayer p, string command, string[] args)
         {
-            var dict = new Dictionary<string, List<TreasureItem>>
+            if (args.Length == 0)
             {
-                ["easy"] = new List<TreasureItem>(),
-                ["medium"] = new List<TreasureItem>(),
-                ["hard"] = new List<TreasureItem>()
-            };
+                p.Reply("Valid arguments: easy medium hard expert nightmare loot all");
+                p.Reply("Valid arguments: 0 1 2 3 4 loot all");
+                return;
+            }
+
+            string file = $"{Interface.Oxide.ConfigDirectory}/{Name}.backup.{DateTime.Now:yyyy-MM-dd hh-mm-ss}.json";
+            Config.WriteObject(_config, false, file);
+            Puts("Created config backup: {0}", file);
+
+            var list = new List<TreasureItem>();
 
             foreach (var def in ItemManager.GetItemDefinitions())
             {
-                dict["easy"].Add(new TreasureItem
+                list.Add(new TreasureItem
                 {
-                    amount = def.stackable,
-                    amountMin = 1,
-                    shortname = def.shortname,
-                });
-                dict["medium"].Add(new TreasureItem
-                {
-                    amount = def.stackable,
-                    amountMin = 1,
-                    shortname = def.shortname,
-                });
-                dict["hard"].Add(new TreasureItem
-                {
-                    amount = def.stackable,
-                    amountMin = 1,
                     shortname = def.shortname,
                 });
             }
 
-            dict["easy"].Sort((x, y) => x.shortname.CompareTo(y.shortname));
-            dict["medium"].Sort((x, y) => x.shortname.CompareTo(y.shortname));
-            dict["hard"].Sort((x, y) => x.shortname.CompareTo(y.shortname));
-            Interface.Oxide.DataFileSystem.WriteObject("loot", dict);
-            p.Reply("Saved to `loot` in data directory.");
+            list.Sort((x, y) => x.shortname.CompareTo(y.shortname));
+
+            foreach (var str in args)
+            {
+                string arg = str.ToLower();
+
+                if (IsEasy(arg) || arg == "all")
+                {
+                    AddToList(_config.Treasure.LootEasy, list);
+                    p.Reply("Saved to `Loot (Easy Difficulty)`");
+                }
+                else if (IsMedium(arg) || arg == "all")
+                {
+                    AddToList(_config.Treasure.LootMedium, list);
+                    p.Reply("Saved to `Loot (Medium Difficulty)`");
+                }
+                else if (IsHard(arg) || arg == "all")
+                {
+                    AddToList(_config.Treasure.LootHard, list);
+                    p.Reply("Saved to `Loot (Hard Difficulty)`");
+                }
+                else if (IsExpert(arg) || arg == "all")
+                {
+                    AddToList(_config.Treasure.LootExpert, list);
+                    p.Reply("Saved to `Loot (Expert Difficulty)`");
+                }
+                else if (IsNightmare(arg) || arg == "all")
+                {
+                    AddToList(_config.Treasure.LootNightmare, list);
+                    p.Reply("Saved to `Loot (Nightmare Difficulty)`");
+                }
+                else if (arg == "loot" || arg == "all")
+                {
+                    AddToList(_config.Treasure.Loot, list);
+                    p.Reply("Saved to `Loot`");
+                }
+            }
+
+            SaveConfig();
+        }
+
+        private void AddToList(List<TreasureItem> a, List<TreasureItem> b)
+        {
+            foreach (var item in b)
+            {
+                if (!a.Contains(item, itemComparer))
+                {
+                    a.Add(item);
+                }
+            }
         }
 
         private void CommandConfig(IPlayer p, string command, string[] args)
@@ -9387,15 +9413,17 @@ namespace Oxide.Plugins
 
         #region Helpers
 
-        private static bool IsEasy(string value) => value == "0" || value == "easy" || value == Backbone.RemoveFormatting(Backbone.GetMessage("ModeEasy")).ToLower();
+        private static bool IsPVE() => Backbone.Plugin.NextGenPVE != null || Backbone.Plugin.TruePVE != null;
 
-        private static bool IsMedium(string value) => value == "1" || value == "med" || value == "medium" || value == Backbone.RemoveFormatting(Backbone.GetMessage("ModeMedium")).ToLower();
+        private static bool IsEasy(string value) => value == "0" || value == "easy" || value == Backbone.Easy;
 
-        private static bool IsHard(string value) => value == "2" || value == "hard" || value == Backbone.RemoveFormatting(Backbone.GetMessage("ModeHard")).ToLower();
+        private static bool IsMedium(string value) => value == "1" || value == "med" || value == "medium" || value == Backbone.Medium;
 
-        private static bool IsExpert(string value) => value == "3" || value == "expert" || value == Backbone.RemoveFormatting(Backbone.GetMessage("ModeExpert")).ToLower();
+        private static bool IsHard(string value) => value == "2" || value == "hard" || value == Backbone.Hard;
 
-        private static bool IsNightmare(string value) => value == "4" || value == "nm" || value == "nightmare" || value == Backbone.RemoveFormatting(Backbone.GetMessage("ModeNightmare")).ToLower();
+        private static bool IsExpert(string value) => value == "3" || value == "expert" || value == Backbone.Expert;
+
+        private static bool IsNightmare(string value) => value == "4" || value == "nm" || value == "nightmare" || value == Backbone.Nightmare;
 
         private void UpdateUI()
         {
@@ -9414,10 +9442,12 @@ namespace Oxide.Plugins
         {
             if (!player || Vanish == null || !Vanish.IsLoaded)
             {
-                return _false;
+                return false;
             }
 
-            return Vanish.Call<bool>("IsInvisible", player);
+            var success = Vanish?.Call("IsInvisible", player);
+
+            return success is bool ? (bool)success : false;
         }
 
         private static void NullifyDamage(HitInfo hitInfo, BaseCombatEntity entity = null)
@@ -9448,32 +9478,32 @@ namespace Oxide.Plugins
 
         private bool ShouldHandleEntity(BaseEntity entity)
         {
-            return entity is BuildingBlock || entity is SimpleBuildingBlock || entity.name.Contains("assets/prefabs/deployable/") || entity is BoxStorage || entity is BuildingPrivlidge || entity is Door;
+            return entity is BuildingBlock || entity is SimpleBuildingBlock || entity.name.Contains("assets/prefabs/deployable/");
         }
 
         public static bool MustExclude(RaidableType type, bool allowPVP)
         {
             if (!_config.Settings.Maintained.IncludePVE && type == RaidableType.Maintained && !allowPVP)
             {
-                return _true;
+                return true;
             }
 
             if (!_config.Settings.Maintained.IncludePVP && type == RaidableType.Maintained && allowPVP)
             {
-                return _true;
+                return true;
             }
 
             if (!_config.Settings.Schedule.IncludePVE && type == RaidableType.Scheduled && !allowPVP)
             {
-                return _true;
+                return true;
             }
 
             if (!_config.Settings.Schedule.IncludePVP && type == RaidableType.Scheduled && allowPVP)
             {
-                return _true;
+                return true;
             }
 
-            return _false;
+            return false;
         }
 
         private static List<BasePlayer> GetMountedPlayers(BaseMountable m)
@@ -9513,30 +9543,12 @@ namespace Oxide.Plugins
             {
                 if (x.npcs.Count > 0)
                 {
-                    return _true;
+                    return true;
                 }
             }
 
-            return _false;
+            return false;
         }
-
-        /*private bool AnyLootable()
-        {
-            foreach (var raid in Raids.Values)
-            {
-                if (_config.Settings.Management.PlayersLootableInPVE && !raid.AllowPVP)
-                {
-                    return _true;
-                }
-
-                if (_config.Settings.Management.PlayersLootableInPVP && raid.AllowPVP)
-                {
-                    return _true;
-                }
-            }
-
-            return _false;
-        }*/
 
         private void DestroyComponents()
         {
@@ -9763,20 +9775,20 @@ namespace Oxide.Plugins
         {
             if (e == null || e.net == null || e.IsDestroyed || e.transform == null)
             {
-                return _false;
+                return false;
             }
 
-            return _true;
+            return true;
         }
 
-        private static bool IsValid(Item item)
+        private bool IsValid(Item item)
         {
             if (item == null || !item.IsValid() || item.isBroken)
             {
-                return _false;
+                return false;
             }
 
-            return _true;
+            return true;
         }
 
         private bool IsValid(string[] args)
@@ -9786,7 +9798,7 @@ namespace Oxide.Plugins
 
         private void DropOrRemoveItems(StorageContainer container, bool isOpened = true)
         {
-            if (RaidableBase.IsProtectedWeapon(container) || (container is BuildingPrivlidge && !_config.Settings.Management.AllowCupboardLoot) || !isOpened)
+            if (!isOpened || RaidableBase.IsProtectedWeapon(container) || (container is BuildingPrivlidge && !_config.Settings.Management.AllowCupboardLoot))
             {
                 container.inventory.Clear();
             }
@@ -9802,7 +9814,7 @@ namespace Oxide.Plugins
 
                 container.inventory.Drop(StringPool.Get(545786656), dropPos, container.transform.rotation);
             }
-            
+
             container.Invoke(container.KillMessage, 0.1f);
         }
 
@@ -9810,11 +9822,11 @@ namespace Oxide.Plugins
         {
             if (Time.realtimeSinceStartup - lastSpawnRequestTime < 2f)
             {
-                return _true;
+                return true;
             }
 
             lastSpawnRequestTime = Time.realtimeSinceStartup;
-            return _false;
+            return false;
         }
 
         private bool DespawnBase(Vector3 target)
@@ -9823,12 +9835,12 @@ namespace Oxide.Plugins
 
             if (raid == null)
             {
-                return _false;
+                return false;
             }
 
             raid.Despawn();
 
-            return _true;
+            return true;
         }
 
         private static RaidableBase GetNearestBase(Vector3 target)
@@ -9837,35 +9849,25 @@ namespace Oxide.Plugins
 
             foreach (var x in Backbone.Plugin.Raids.Values)
             {
-                if (Distance2D(x.Location, target) < 100f)
+                if (InRange(x.Location, target, 100f))
                 {
                     values.Add(x);
                 }
             }
 
-            if (values.Count == 0)
+            int count = values.Count;
+
+            if (count == 0)
             {
                 return null;
             }
 
-            if (values.Count > 1)
+            if (count > 1)
             {
                 values.Sort((a, b) => (a.Location - target).sqrMagnitude.CompareTo((b.Location - target).sqrMagnitude));
             }
 
-            var raid = values[0];
-
-            values.Clear();
-
-            return raid;
-        }
-
-        private void SetUnloading()
-        {
-            foreach (var raid in Raids.Values)
-            {
-                raid.IsUnloading = true;
-            }
+            return values[0];
         }
 
         private void DespawnAllBasesNow()
@@ -9887,14 +9889,7 @@ namespace Oxide.Plugins
 
         private void DestroyAll()
         {
-            if (Raids.Count == 0)
-            {
-                return;
-            }
-
-            var raidables = new List<RaidableBase>(Raids.Values);
-
-            foreach (var raid in raidables)
+            foreach (var raid in Raids.Values.ToList())
             {
                 Interface.CallHook("OnRaidableBaseDespawn", raid.Location, raid.spawnTime, raid.ID);
                 Puts(Backbone.GetMessage("Destroyed Raid", null, raid.Location));
@@ -9902,8 +9897,6 @@ namespace Oxide.Plugins
                 raid.Despawn();
                 UnityEngine.Object.Destroy(raid.gameObject);
             }
-
-            raidables.Clear();
         }
 
         private void StartDespawnInvokes()
@@ -9913,20 +9906,16 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var entries = new List<KeyValuePair<int, List<BaseEntity>>>(Bases);
             float num = 0f;
-            List<BaseEntity> entities;
 
-            foreach (var entry in entries)
+            foreach (var entry in Bases)
             {
                 if (entry.Value == null || entry.Value.Count == 0)
                 {
                     continue;
                 }
 
-                entities = new List<BaseEntity>(entry.Value);
-
-                foreach (var e in entities)
+                foreach (var e in entry.Value)
                 {
                     if (e != null && !e.IsDestroyed)
                     {
@@ -9948,11 +9937,7 @@ namespace Oxide.Plugins
                         }, num += 0.002f);
                     }
                 }
-
-                entities.Clear();
             }
-
-            entries.Clear();
         }
 
         private void StopDespawnCoroutine()
@@ -9982,19 +9967,21 @@ namespace Oxide.Plugins
 
         private IEnumerator DespawnCoroutine()
         {
-            var list = new List<RaidableBase>(Raids.Values);
-
-            while (list.Count > 0)
+            while (Raids.Count > 0)
             {
-                int baseIndex = list[0].BaseIndex;
-                list[0].Despawn();
+                var raid = Raids.ElementAt(0).Value;
+                var baseIndex = raid.BaseIndex;
+                var uid = raid.uid;
+
+                raid.Despawn();
 
                 do
                 {
                     yield return Coroutines.WaitForSeconds(0.1f);
                 } while (Bases.ContainsKey(baseIndex));
 
-                list.RemoveAt(0);
+                Raids.Remove(uid);
+                yield return Coroutines.WaitForSeconds(0.1f);
             }
 
             despawnCoroutine = null;
@@ -10004,28 +9991,45 @@ namespace Oxide.Plugins
         {
             if (!entity.IsValid())
             {
-                return _false;
+                return false;
             }
 
-            return RaidableBase.IsProtectedWeapon(entity) || entity is TeslaCoil || entity is FireBall || entity is BaseTrap || entity.skinID == 1587601905 || Backbone.Path.TrueDamage.Contains(entity.prefabID);
+            return entity.skinID == 1587601905 || Backbone.Path.TrueDamage.Contains(entity.prefabID) || RaidableBase.IsProtectedWeapon(entity) || entity is TeslaCoil || entity is FireBall || entity is BaseTrap;
         }
 
         private bool EventTerritory(Vector3 position)
         {
             foreach (var raid in Raids.Values)
             {
-                if (Distance2D(raid.Location, position) <= raid.Options.ProtectionRadius)
+                if (InRange(raid.Location, position, raid.Options.ProtectionRadius))
                 {
-                    return _true;
+                    return true;
                 }
             }
 
-            return _false;
+            return false;
         }
 
-        private static float Distance2D(Vector3 a, Vector3 b)
+        private bool CanBlockOutsideDamage(RaidableBase raid, BasePlayer attacker, bool isEnabled)
         {
-            return (new Vector3(a.x, 0f, a.z) - new Vector3(b.x, 0f, b.z)).magnitude;
+            if (isEnabled)
+            {
+                float radius = Mathf.Max(raid.Options.ProtectionRadius, raid.Options.ArenaWalls.Radius, Radius);
+
+                return (attacker.transform.position - raid.Location).sqrMagnitude > radius * radius;
+            }
+
+            return false;
+        }
+
+        private static bool InRange(Vector3 a, Vector3 b, float distance, bool ex = true)
+        {
+            if (!ex)
+            {
+                return (a - b).sqrMagnitude <= distance * distance;
+            }
+
+            return (new Vector3(a.x, 0f, a.z) - new Vector3(b.x, 0f, b.z)).sqrMagnitude <= distance * distance;
         }
 
         private void SetWorkshopIDs()
@@ -10037,7 +10041,7 @@ namespace Oxide.Plugins
             }
 
             List<ulong> skins;
-            List<ulong> workshopSkins;
+            HashSet<ulong> workshopSkins;
 
             foreach (var def in ItemManager.GetItemDefinitions())
             {
@@ -10045,33 +10049,32 @@ namespace Oxide.Plugins
 
                 foreach (var asi in Rust.Workshop.Approved.All)
                 {
-                    if (asi.Value != null && !string.IsNullOrEmpty(asi.Value.Name) && asi.Value.Name == def.shortname)
+                    if (asi.Value?.Name == def.shortname)
                     {
                         skins.Add(Convert.ToUInt64(asi.Value.WorkshopdId));
                     }
                 }
 
-                if (skins.Count > 0)
+                if (skins.Count == 0)
                 {
-                    if (!WorkshopSkins.TryGetValue(def.shortname, out workshopSkins))
-                    {
-                        WorkshopSkins[def.shortname] = workshopSkins = new List<ulong>();
-                    }
-
-                    foreach (ulong skin in skins)
-                    {
-                        if (!workshopSkins.Contains(skin))
-                        {
-                            workshopSkins.Add(skin);
-                        }
-                    }
-
-                    skins.Clear();
+                    continue;
                 }
+
+                if (!WorkshopSkins.TryGetValue(def.shortname, out workshopSkins))
+                {
+                    WorkshopSkins[def.shortname] = workshopSkins = new HashSet<ulong>();
+                }
+
+                foreach (ulong skin in skins)
+                {
+                    workshopSkins.Add(skin);
+                }
+
+                skins.Clear();
             }
         }
 
-        private bool AssignTreasureHunters(List<KeyValuePair<string, int>> ladder)
+        private bool AssignTreasureHunters()
         {
             foreach (var target in covalence.Players.All)
             {
@@ -10086,9 +10089,18 @@ namespace Oxide.Plugins
             }
 
             if (!_config.RankedLadder.Enabled)
-                return _true;
+                return true;
 
-            ladder.RemoveAll(x => x.Value < 1);
+            var ladder = new List<KeyValuePair<string, int>>();
+
+            foreach (var entry in storedData.Players)
+            {
+                if (entry.Value.Raids > 0)
+                {
+                    ladder.Add(new KeyValuePair<string, int>(entry.Key, entry.Value.Raids));
+                }
+            }
+
             ladder.Sort((x, y) => y.Value.CompareTo(x.Value));
 
             int permsGiven = 0;
@@ -10103,7 +10115,7 @@ namespace Oxide.Plugins
 
                 permission.GrantUserPermission(p.Id, rankLadderPermission, this);
                 permission.AddUserGroup(p.Id, rankLadderGroup);
-                
+
                 LogToFile("treasurehunters", DateTime.Now.ToString() + " : " + Backbone.GetMessage("Log Stolen", null, p.Name, p.Id, ladder[i].Value), this, true);
                 Puts(Backbone.GetMessage("Log Granted", null, p.Name, p.Id, rankLadderPermission, rankLadderGroup));
 
@@ -10116,7 +10128,7 @@ namespace Oxide.Plugins
                 Puts(Backbone.GetMessage("Log Saved", null, "treasurehunters"));
             }
 
-            return _true;
+            return true;
         }
 
         private void AddMapPrivatePluginMarker(Vector3 position, int uid)
@@ -10127,7 +10139,7 @@ namespace Oxide.Plugins
             }
 
             mapMarkers[uid] = new MapInfo { IconName = _config.LustyMap.IconName, Position = position, Url = _config.LustyMap.IconFile };
-            Map.Call("ApiAddPointUrl", _config.LustyMap.IconFile, _config.LustyMap.IconName, position);
+            Map?.Call("ApiAddPointUrl", _config.LustyMap.IconFile, _config.LustyMap.IconName, position);
         }
 
         private void RemoveMapPrivatePluginMarker(int uid)
@@ -10138,7 +10150,7 @@ namespace Oxide.Plugins
             }
 
             var mapInfo = mapMarkers[uid];
-            Map.Call("ApiRemovePointUrl", mapInfo.Url, mapInfo.IconName, mapInfo.Position);
+            Map?.Call("ApiRemovePointUrl", mapInfo.Url, mapInfo.IconName, mapInfo.Position);
             mapMarkers.Remove(uid);
         }
 
@@ -10150,7 +10162,7 @@ namespace Oxide.Plugins
             }
 
             string name = string.Format("{0}_{1}", _config.LustyMap.IconName, storedData.TotalEvents).ToLower();
-            LustyMap.Call("AddTemporaryMarker", pos.x, pos.z, name, _config.LustyMap.IconFile, _config.LustyMap.IconRotation);
+            LustyMap?.Call("AddTemporaryMarker", pos.x, pos.z, name, _config.LustyMap.IconFile, _config.LustyMap.IconRotation);
             lustyMarkers[uid] = name;
         }
 
@@ -10161,13 +10173,13 @@ namespace Oxide.Plugins
                 return;
             }
 
-            LustyMap.Call("RemoveTemporaryMarker", lustyMarkers[uid]);
+            LustyMap?.Call("RemoveTemporaryMarker", lustyMarkers[uid]);
             lustyMarkers.Remove(uid);
         }
 
         private void RemoveAllThirdPartyMarkers()
         {
-            if (LustyMap != null && LustyMap.IsLoaded && lustyMarkers.Count > 0)
+            if (lustyMarkers.Count > 0)
             {
                 var lusty = new Dictionary<int, string>(lustyMarkers);
 
@@ -10179,7 +10191,7 @@ namespace Oxide.Plugins
                 lusty.Clear();
             }
 
-            if (Map != null && Map.IsLoaded && mapMarkers.Count > 0)
+            if (mapMarkers.Count > 0)
             {
                 var maps = new Dictionary<int, MapInfo>(mapMarkers);
 
@@ -10225,7 +10237,7 @@ namespace Oxide.Plugins
             string message;
             RaidableMode mode;
 
-            if (!CanSpawnDifficultyToday(RaidableMode.Easy) && !CanSpawnDifficultyToday(RaidableMode.Medium) && !CanSpawnDifficultyToday(RaidableMode.Hard) && !CanSpawnDifficultyToday(RaidableMode.Expert) && !CanSpawnDifficultyToday(RaidableMode.Nightmare))
+            if (!CanContinueAutomation())
             {
                 Puts(Backbone.GetMessage("MaintainCoroutineFailedToday"));
                 yield break;
@@ -10239,7 +10251,7 @@ namespace Oxide.Plugins
                     continue;
                 }
 
-                mode = GetRandomDifficulty();
+                mode = GetRandomDifficulty(RaidableType.Maintained);
 
                 if (!IsModeValid(mode) || !CanMaintainOpenEvent() || CopyPaste == null || !CopyPaste.IsLoaded)
                 {
@@ -10282,16 +10294,9 @@ namespace Oxide.Plugins
             }
         }
 
-        private int maxOnce { get; set; }
-
-        private bool MaxOnce()
-        {
-            return _config.Settings.Schedule.MaxOnce <= 0 || maxOnce < _config.Settings.Schedule.MaxOnce;
-        }
-
         private IEnumerator ScheduleCoroutine()
         {
-            if (!CanSpawnDifficultyToday(RaidableMode.Easy) && !CanSpawnDifficultyToday(RaidableMode.Medium) && !CanSpawnDifficultyToday(RaidableMode.Hard) && !CanSpawnDifficultyToday(RaidableMode.Expert) && !CanSpawnDifficultyToday(RaidableMode.Nightmare))
+            if (!CanContinueAutomation())
             {
                 Puts(Backbone.GetMessage("ScheduleCoroutineFailedToday"));
                 yield break;
@@ -10320,11 +10325,11 @@ namespace Oxide.Plugins
                             continue;
                         }
 
-                        mode = GetRandomDifficulty();
+                        mode = GetRandomDifficulty(RaidableType.Scheduled);
 
                         if (IsModeValid(mode) && SpawnRandomBase(out message, RaidableType.Scheduled, mode) != Vector3.zero)
                         {
-                            maxOnce++;
+                            _maxOnce++;
                             yield return Coroutines.WaitForSeconds(15f);
                             continue;
                         }
@@ -10332,7 +10337,7 @@ namespace Oxide.Plugins
                         yield return Coroutines.WaitForSeconds(1f);
                     }
 
-                    maxOnce = 0;
+                    _maxOnce = 0;
                     raidInterval = Core.Random.Range(_config.Settings.Schedule.IntervalMin, _config.Settings.Schedule.IntervalMax);
                     storedData.RaidTime = DateTime.Now.AddSeconds(raidInterval).ToString();
                     Puts(Backbone.GetMessage("Next Automated Raid", null, FormatTime(raidInterval), DateTime.Now.AddSeconds(raidInterval)));
@@ -10343,17 +10348,35 @@ namespace Oxide.Plugins
             }
         }
 
+        private bool MaxOnce()
+        {
+            return _config.Settings.Schedule.MaxOnce <= 0 || _maxOnce < _config.Settings.Schedule.MaxOnce;
+        }
+
+        private bool CanContinueAutomation()
+        {
+            foreach (RaidableMode mode in Enum.GetValues(typeof(RaidableMode)))
+            {
+                if (CanSpawnDifficultyToday(mode))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static bool IsModeValid(RaidableMode mode) => mode != RaidableMode.Disabled && mode != RaidableMode.Random;
 
         private double GetRaidTime() => DateTime.Parse(storedData.RaidTime).Subtract(DateTime.Now).TotalSeconds;
-        
+
         private bool CanScheduleOpenEvent() => GetRaidTime() <= 0 && RaidableBase.Get(RaidableType.Scheduled) < _config.Settings.Schedule.Max && IsPasteAvailable && !IsGridLoading && BasePlayer.activePlayerList.Count >= _config.Settings.Schedule.PlayerLimit;
 
         private void DoLockoutRemoves()
         {
-            var lockouts = new Dictionary<string, Lockout>(storedData.Lockouts);
+            var keys = new List<string>();
 
-            foreach (var lockout in lockouts)
+            foreach (var lockout in storedData.Lockouts)
             {
                 if (lockout.Value.Easy - Epoch.Current <= 0)
                 {
@@ -10382,11 +10405,14 @@ namespace Oxide.Plugins
 
                 if (!lockout.Value.Any())
                 {
-                    storedData.Lockouts.Remove(lockout.Key);
+                    keys.Add(lockout.Key);
                 }
             }
 
-            lockouts.Clear();
+            foreach (string key in keys)
+            {
+                storedData.Lockouts.Remove(key);
+            }
         }
 
         private void SaveData()
@@ -10405,25 +10431,48 @@ namespace Oxide.Plugins
             return PositionToGrid(position);
         }
 
-        public static string PositionToGrid(Vector3 position) // Credits: yetzt
+        /*public static string PositionToGrid(Vector3 position) // Credit: yetzt/Dana/nivex
         {
             var r = new Vector2(World.Size / 2 + position.x, World.Size / 2 + position.z);
-            var x = Mathf.Floor(r.x / 146.3f) % 26;
-            var z = Mathf.Floor(World.Size / 146.3f) - Mathf.Floor(r.y / 146.3f);
+            var f = Mathf.Floor(r.x / 148.4f);
+            var x = f % 26;
+            var c = Mathf.Floor(f / 26);
+            var z = Mathf.Floor(World.Size / 148.4f) - Mathf.Floor(r.y / 148.4f);
+            var s = c <= 0 ? string.Empty : ((char)('A' + (c - 1))).ToString();
+            
+            return $"{s}{(char)('A' + x)}{z}";
+        }*/
 
-            return $"{(char)('A' + x)}{z}";
+        private static string PositionToGrid(Vector3 position) // Credit: MagicGridPanel
+        {
+            int maxGridSize = Mathf.FloorToInt(World.Size / 146.3f) - 1;
+            int xGrid = Mathf.Clamp(Mathf.FloorToInt((position.x + (World.Size / 2f)) / 146.3f), 0, maxGridSize);
+            string extraA = string.Empty;
+            if (xGrid > 26) extraA = $"{(char)('A' + (xGrid / 26 - 1))}";
+            return $"{extraA}{(char)('A' + xGrid % 26)}{Mathf.Clamp(maxGridSize - Mathf.FloorToInt((position.z + (World.Size / 2f)) / 146.3f), 0, maxGridSize).ToString()}";
         }
-        
+
         private static string FormatTime(double seconds)
         {
-            var ts = TimeSpan.FromSeconds(seconds);
+            if (seconds < 0)
+            {
+                return "0s";
+            }
 
-            return string.Format("{0:D2}h {1:D2}m {2:D2}s", ts.Hours, ts.Minutes, ts.Seconds);
+            var ts = TimeSpan.FromSeconds(seconds);
+            string format = Backbone.GetMessage("TimeFormat");
+
+            if (format == "TimeFormat")
+            {
+                format = "{0:D2}h {1:D2}m {2:D2}s";
+            }
+
+            return string.Format(format, ts.Hours, ts.Minutes, ts.Seconds);
         }
 
-        #endregion
+#endregion
 
-        #region Config
+#region Config
 
         private Dictionary<string, Dictionary<string, string>> GetMessages()
         {
@@ -10596,9 +10645,6 @@ namespace Oxide.Plugins
                 }},
                 {"PasteOnCooldown", new Dictionary<string, string>() {
                     {"en", "Paste is on cooldown!"},
-                }},
-                {"BuyableOnCooldown", new Dictionary<string, string>() {
-                    {"en", "Try again, a buyable raid was already requested."},
                 }},
                 {"SpawnOnCooldown", new Dictionary<string, string>() {
                     {"en", "Try again, a manual spawn was already requested."},
@@ -10866,7 +10912,37 @@ namespace Oxide.Plugins
                 {"HoggingFinishYourRaidFriend", new Dictionary<string, string>() {
                     {"en", "<color=#FF0000>Your friend `{0}` must finish their last raid at {1}.</color>"},
                 }},
-            };
+                {"TimeFormat", new Dictionary<string, string>() {
+                    {"en", "{0:D2}h {1:D2}m {2:D2}s"},
+                }},
+                {"BuyableAlreadyRequested", new Dictionary<string, string>() {
+                    {"en", "You must wait 2 seconds to try buying again."},
+                }},
+                {"BuyableServerRestarting", new Dictionary<string, string>() {
+                    {"en", "You cannot buy a raid when a server restart is pending."},
+                }},
+                {"BuyableServerSaving", new Dictionary<string, string>() {
+                    {"en", "You cannot buy a raid while the server is saving."},
+                }},
+                {"BuyableAlreadyOwner", new Dictionary<string, string>() {
+                    {"en", "You cannot buy multiple raids."},
+                }},
+                {"TargetTooFar", new Dictionary<string, string>() {
+                    {"en", "Your target is not close enough to a raid."},
+                }},
+                {"TooFar", new Dictionary<string, string>() {
+                    {"en", "You are not close enough to a raid."},
+                }},
+                {"RaidLockedTo", new Dictionary<string, string>() {
+                    {"en", "Raid has been locked to: {0}"},
+                }},
+                {"RemovedLockFor", new Dictionary<string, string>() {
+                    {"en", "Removed lockout for {0} ({1})"},
+                }},
+                {"RaidOwnerCleared", new Dictionary<string, string>() {
+                    {"en", "Raid owner has been cleared."},
+                }},
+            }; 
         }
 
         protected override void LoadDefaultMessages()
@@ -10888,21 +10964,33 @@ namespace Oxide.Plugins
                 lang.RegisterMessages(cLangs.Value, this, cLangs.Key);
         }
 
-        private static int GetPercentIncreasedAmount(int amount)
+        private static int GetPercentAmount(int amount)
         {
             decimal percentLoss = _config.Treasure.PercentLoss;
 
-            if (percentLoss > 0m)
+            if (percentLoss > 0m && (percentLoss /= 100m) > 0m)
             {
-                percentLoss /= 100m;
+                amount = Convert.ToInt32(amount - (amount * percentLoss));
+
+                if (_config.Treasure.UseDOWL && !_config.Treasure.Increased)
+                {
+                    return amount;
+                }
             }
 
-            if (_config.Treasure.UseDOWL && !_config.Treasure.Increased && percentLoss > 0m)
+            decimal percentIncrease = GetDayPercentIncrease();
+
+            if (percentIncrease > 0m && (percentIncrease /= 100m) > 0m)
             {
-                return UnityEngine.Random.Range(Convert.ToInt32(amount - (amount * percentLoss)), amount + 1);
+                return Convert.ToInt32(amount + (amount * percentIncrease));
             }
 
-            decimal percentIncrease = 0m;
+            return amount;
+        }
+
+        private static decimal GetDayPercentIncrease()
+        {
+            decimal percentIncrease;
 
             switch (DateTime.Now.DayOfWeek)
             {
@@ -10936,34 +11024,19 @@ namespace Oxide.Plugins
                         percentIncrease = _config.Treasure.PercentIncreaseOnSaturday;
                         break;
                     }
-                case DayOfWeek.Sunday:
+                default:
                     {
                         percentIncrease = _config.Treasure.PercentIncreaseOnSunday;
                         break;
                     }
             }
 
-            if (percentIncrease > 1m)
-            {
-                percentIncrease /= 100;
-            }
-
-            if (percentIncrease > 0m)
-            {
-                amount = Convert.ToInt32(amount + (amount * percentIncrease));
-
-                if (_config.Treasure.PercentLoss > 0m)
-                {
-                    amount = UnityEngine.Random.Range(Convert.ToInt32(amount - (amount * _config.Treasure.PercentLoss)), amount + 1);
-                }
-            }
-
-            return amount;
+            return percentIncrease;
         }
 
-        #endregion
+#endregion
 
-        #region Configuration
+#region Configuration
 
         private static Configuration _config;
 
@@ -11163,8 +11236,41 @@ namespace Oxide.Plugins
             public string Nightmare { get; set; } = "000000";
         }
 
+        public class PluginSettingsBaseManagementMountables
+        {
+            [JsonProperty(PropertyName = "Boats")]
+            public bool Boats { get; set; }
+
+            [JsonProperty(PropertyName = "Cars (Basic)")]
+            public bool BasicCars { get; set; }
+
+            [JsonProperty(PropertyName = "Cars (Modular)")]
+            public bool ModularCars { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Chinook")]
+            public bool CH47 { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Horses")]
+            public bool Horses { get; set; }
+
+            [JsonProperty(PropertyName = "MiniCopters")]
+            public bool MiniCopters { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Pianos")]
+            public bool Pianos { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Scrap Transport Helicopters")]
+            public bool Scrap { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Mounts Without OwnerID")]
+            public bool Owner { get; set; } = true;
+        }
+
         public class PluginSettingsBaseManagement
         {
+            [JsonProperty(PropertyName = "Eject Mounts")]
+            public PluginSettingsBaseManagementMountables Mounts { get; set; } = new PluginSettingsBaseManagementMountables();
+
             [JsonProperty(PropertyName = "Max Percent Allowed To Spawn Per Difficulty (0 = ignore)")]
             public PluginSettingsBasePercentages Percent { get; set; } = new PluginSettingsBasePercentages();
 
@@ -11200,6 +11306,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Allow Cupboard Loot To Drop")]
             public bool AllowCupboardLoot { get; set; } = true;
+
+            [JsonProperty(PropertyName = "Allow Players To Build")]
+            public bool AllowBuilding { get; set; } = true;
 
             [JsonProperty(PropertyName = "Allow Player Bags To Be Lootable At PVP Bases")]
             public bool PlayersLootableInPVP { get; set; } = true;
@@ -11248,6 +11357,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Building Blocks Are Immune To Damage")]
             public bool BlocksImmune { get; set; }
+
+            //[JsonProperty(PropertyName = "Destroy Dropped Container Loot On Despawn")]
+            //public bool DestroyLoot { get; set; }
 
             [JsonProperty(PropertyName = "Do Not Destroy Player Built Deployables")]
             public bool DoNotDestroyDeployables { get; set; }
@@ -11302,6 +11414,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "PVP Delay Between Zone Hopping")]
             public float PVPDelay { get; set; } = 10f;
+
+            [JsonProperty(PropertyName = "Prevent Fire From Spreading")]
+            public bool PreventFireFromSpreading { get; set; } = true;
 
             [JsonProperty(PropertyName = "Prevent Players From Hogging Raids")]
             public bool PreventHogging { get; set; } = true;
@@ -11383,6 +11498,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Allowed Zone Manager Zones", ObjectCreationHandling = ObjectCreationHandling.Replace)]
             public List<string> Inclusions { get; set; } = new List<string> { "pvp", "99999999" };
+
+            [JsonProperty(PropertyName = "Amount Of Entities To Undo Per Batch (1 = Slowest But Better Performance, 0 = Wait For Each Entity To Be Destroyed)")]
+            public int BatchLimit { get; set; } = 10;
 
             [JsonProperty(PropertyName = "Automatically Teleport Admins To Their Map Marker Positions")]
             public bool TeleportMarker { get; set; }
@@ -11603,16 +11721,16 @@ namespace Oxide.Plugins
             public List<TreasureItem> Loot { get; set; } = new List<TreasureItem>();
 
             [JsonProperty(PropertyName = "Add Code Lock To Unlocked Or KeyLocked Doors")]
-            public bool DoorLock { get; set; } = _true;
+            public bool DoorLock { get; set; } = true;
 
             [JsonProperty(PropertyName = "Close Open Doors With No Door Controller Installed")]
-            public bool CloseOpenDoors { get; set; } = _true;
+            public bool CloseOpenDoors { get; set; } = true;
 
             [JsonProperty(PropertyName = "Allow Base To Float Above Water")]
             public bool Submerged { get; set; }
 
             [JsonProperty(PropertyName = "Allow BuildRevert Ladders")]
-            public bool AllowBuildRevertLadders { get; set; } = _true;
+            public bool AllowBuildRevertLadders { get; set; } = true;
 
             [JsonProperty(PropertyName = "Allow Duplicate Items")]
             public bool AllowDuplicates { get; set; }
@@ -11621,13 +11739,13 @@ namespace Oxide.Plugins
             public bool AllowPickup { get; set; }
 
             [JsonProperty(PropertyName = "Allow Players To Deploy A Cupboard")]
-            public bool AllowBuildingPriviledges { get; set; } = _true;
+            public bool AllowBuildingPriviledges { get; set; } = true;
 
             [JsonProperty(PropertyName = "Allow PVP")]
-            public bool AllowPVP { get; set; } = _true;
+            public bool AllowPVP { get; set; } = true;
 
             [JsonProperty(PropertyName = "Allow Friendly Fire (Teams)")]
-            public bool AllowFriendlyFire { get; set; } = _true;
+            public bool AllowFriendlyFire { get; set; } = true;
 
             [JsonProperty(PropertyName = "Amount Of Items To Spawn")]
             public int TreasureAmount { get; set; } = 6;
@@ -11656,11 +11774,17 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Drop Container Loot X Seconds After It Is Looted")]
             public float DropTimeAfterLooting { get; set; }
 
+            [JsonProperty(PropertyName = "Drop Container Loot Applies Only To Boxes And Cupboards")]
+            public bool DropOnlyBoxesAndPrivileges { get; set; } = true;
+
             [JsonProperty(PropertyName = "Create Dome Around Event Using Spheres (0 = disabled, recommended = 5)")]
             public int SphereAmount { get; set; } = 5;
 
             [JsonProperty(PropertyName = "Empty All Containers Before Spawning Loot")]
             public bool EmptyAll { get; set; }
+
+            [JsonProperty(PropertyName = "Eject Corpses From Enemy Raids (Advanced Users Only)")]
+            public bool EjectCorpses { get; set; } = true;
 
             [JsonProperty(PropertyName = "Eject Enemies From Purchased PVE Raids")]
             public bool EjectPurchasedPVE { get; set; }
@@ -11690,7 +11814,7 @@ namespace Oxide.Plugins
             public float ProtectionRadius { get; set; } = 50f;
 
             [JsonProperty(PropertyName = "Block Plugins Which Prevent Item Durability Loss")]
-            public bool EnforceDurability { get; set; } = _false;
+            public bool EnforceDurability { get; set; } = false;
 
             [JsonProperty(PropertyName = "Remove Equipped AutoTurret Weapon")]
             public bool RemoveTurretWeapon { get; set; }
@@ -11720,6 +11844,9 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Convert PVE To PVP")]
             public bool ConvertPVE { get; set; }
+
+            [JsonProperty(PropertyName = "Convert PVP To PVE")]
+            public bool ConvertPVP { get; set; }
 
             [JsonProperty(PropertyName = "Every Min Seconds")]
             public double IntervalMin { get; set; } = 3600f;
@@ -11757,6 +11884,9 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Convert PVE To PVP")]
             public bool ConvertPVE { get; set; }
 
+            [JsonProperty(PropertyName = "Convert PVP To PVE")]
+            public bool ConvertPVP { get; set; }
+
             [JsonProperty(PropertyName = "Include PVE Bases")]
             public bool IncludePVE { get; set; } = true;
 
@@ -11787,6 +11917,9 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Convert PVE To PVP")]
             public bool ConvertPVE { get; set; }
 
+            [JsonProperty(PropertyName = "Convert PVP To PVE")]
+            public bool ConvertPVP { get; set; }
+
             [JsonProperty(PropertyName = "Distance To Spawn Bought Raids From Player")]
             public float DistanceToSpawnFrom { get; set; } = 150f;
 
@@ -11810,6 +11943,9 @@ namespace Oxide.Plugins
         {
             [JsonProperty(PropertyName = "Convert PVE To PVP")]
             public bool ConvertPVE { get; set; }
+
+            [JsonProperty(PropertyName = "Convert PVP To PVE")]
+            public bool ConvertPVP { get; set; }
 
             [JsonProperty(PropertyName = "Max Manual Events")]
             public int Max { get; set; } = 1;
@@ -12131,8 +12267,14 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Ammo")]
             public WeaponTypeAmountSettings Ammo { get; set; } = new WeaponTypeAmountSettings();
 
+            [JsonProperty(PropertyName = "Fog Machine Allows Motion Toggle")]
+            public bool FogMotion { get; set; }
+            
             [JsonProperty(PropertyName = "SamSite Repairs Every X Minutes (0.0 = disabled)")]
             public float SamSiteRepair { get; set; } = 5f;
+
+            [JsonProperty(PropertyName = "SamSite Range (350.0 = Rust default)")]
+            public float SamSiteRange { get; set; } = 75f;
         }
 
         public class Configuration
@@ -12303,9 +12445,9 @@ namespace Oxide.Plugins
             Puts("Loaded default configuration file");
         }
 
-        #endregion
+#endregion
 
-        #region UI
+#region UI
 
         public class UI // Credits: Absolut & k1lly0u
         {
@@ -12643,6 +12785,6 @@ namespace Oxide.Plugins
             }
         }
 
-        #endregion UI
+#endregion UI
     }
 }
